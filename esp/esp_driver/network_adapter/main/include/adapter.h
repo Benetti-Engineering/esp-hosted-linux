@@ -207,6 +207,8 @@ enum COMMAND_CODE {
 	CMD_STA_SET_AUTHORIZED = 32,
 	CMD_SET_RADIO_SERVICE = 33,
 	CMD_GET_RADIO_SERVICE = 34,
+	/* Pre-initialization, transport-level reboot with an explicit ACK. */
+	CMD_HOST_REBOOT = 35,
 	CMD_MAX,
 };
 
