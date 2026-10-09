@@ -81,6 +81,158 @@ volatile u8 host_sleep;
 static atomic_t tx_in_flight = ATOMIC_INIT(0);
 static atomic_t sdio_need_counter_rebase;
 static atomic_t sdio_need_slave_reset;
+static atomic_t sdio_hard_reset_requested = ATOMIC_INIT(0);
+static atomic_t sdio_soft_reset_requested = ATOMIC_INIT(0);
+/* Commit epoch at request time: a newer successful boot voids the request. */
+static atomic_t sdio_reset_request_epoch = ATOMIC_INIT(0);
+static atomic_t sdio_soft_reset_attempts = ATOMIC_INIT(0);
+/* The retry counter belongs to a committed firmware incarnation, not to
+ * the asynchronous reset request bit. A new reset_target() can run after
+ * fw_boot_commit_epoch increments but before commit_fw_recovery() executes.
+ * Serialize both paths so a stale counter cannot reject that new reboot. */
+static DEFINE_SPINLOCK(sdio_reset_budget_lock);
+static u32 sdio_soft_reset_budget_epoch;
+static atomic_t sdio_hard_reset_unavailable = ATOMIC_INIT(0);
+
+static void esp_sdio_reset_budget_sync_locked(struct esp_adapter *adapter)
+{
+	u32 epoch = (u32)atomic_read(&adapter->fw_boot_commit_epoch);
+
+	if (sdio_soft_reset_budget_epoch != epoch) {
+		sdio_soft_reset_budget_epoch = epoch;
+		atomic_set(&sdio_soft_reset_attempts, 0);
+	}
+}
+
+static bool esp_sdio_soft_reset_budget_take(struct esp_adapter *adapter)
+{
+	unsigned long flags;
+	bool allowed;
+
+	spin_lock_irqsave(&sdio_reset_budget_lock, flags);
+	esp_sdio_reset_budget_sync_locked(adapter);
+	allowed = atomic_read(&sdio_soft_reset_attempts) < ESP_FW_BOOT_MAX_ATTEMPTS;
+	if (allowed)
+		atomic_inc(&sdio_soft_reset_attempts);
+	spin_unlock_irqrestore(&sdio_reset_budget_lock, flags);
+	return allowed;
+}
+
+static void esp_sdio_soft_reset_budget_drop(void)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&sdio_reset_budget_lock, flags);
+	sdio_soft_reset_budget_epoch = 0;
+	atomic_set(&sdio_soft_reset_attempts, 0);
+	spin_unlock_irqrestore(&sdio_reset_budget_lock, flags);
+}
+
+/* Called under sdio_reset_budget_lock. Keep request intent and attempt
+ * accounting independent: an epoch change resets the old counter even when
+ * the caller has already armed a new-epoch reset before this callback. */
+static void esp_sdio_commit_reset_budget_locked(struct esp_adapter *adapter)
+{
+	esp_sdio_reset_budget_sync_locked(adapter);
+	if (atomic_read(&sdio_reset_request_epoch) !=
+	    atomic_read(&adapter->fw_boot_commit_epoch)) {
+		atomic_set(&sdio_hard_reset_requested, 0);
+		atomic_set(&sdio_soft_reset_requested, 0);
+	}
+}
+
+/* Fallbacks from transport recovery must arm reset intent under the same
+ * lock as commit/restart, otherwise a commit callback can clear the newly
+ * armed soft reset between epoch stamping and bit publication. */
+static bool esp_sdio_soft_reset_budget_arm(struct esp_adapter *adapter)
+{
+	unsigned long flags;
+	bool allowed;
+
+	spin_lock_irqsave(&sdio_reset_budget_lock, flags);
+	esp_sdio_reset_budget_sync_locked(adapter);
+	allowed = atomic_read(&sdio_soft_reset_attempts) < ESP_FW_BOOT_MAX_ATTEMPTS;
+	if (allowed) {
+		atomic_set(&sdio_reset_request_epoch,
+			   atomic_read(&adapter->fw_boot_commit_epoch));
+		atomic_set(&sdio_soft_reset_requested, 1);
+	}
+	spin_unlock_irqrestore(&sdio_reset_budget_lock, flags);
+	return allowed;
+}
+
+/*
+ * Lock order for every operation touching pending SDIO reset intent:
+ * adapter->fw_recovery_lock -> sdio_reset_budget_lock.
+ * The common boot commit advances fw_boot_commit_epoch under the first
+ * lock; request publication and stale cancellation use the second lock.
+ */
+enum esp_sdio_reset_claim {
+	ESP_SDIO_RESET_NONE,
+	ESP_SDIO_RESET_STALE,
+	ESP_SDIO_RESET_HARD,
+	ESP_SDIO_RESET_SOFT,
+};
+
+/* Caller owns both locks in the documented order. Never do MMC/CMD53 or
+ * sleep here. Claim is the reset linearization point: an older worker
+ * cannot carry an intent across a healthy commit of a newer incarnation.
+ */
+static enum esp_sdio_reset_claim
+esp_sdio_claim_reset_locked(struct esp_adapter *adapter)
+{
+	u32 epoch = (u32)atomic_read(&adapter->fw_boot_commit_epoch);
+	u32 request_epoch = (u32)atomic_read(&sdio_reset_request_epoch);
+	bool hard = atomic_read(&sdio_hard_reset_requested);
+	bool soft = atomic_read(&sdio_soft_reset_requested);
+	bool healthy = test_bit(ESP_INIT_DONE, &adapter->state_flags) &&
+		!test_bit(ESP_FW_RECOVERY_PENDING, &adapter->state_flags) &&
+		!test_bit(ESP_FW_RESET_EXPECTED, &adapter->state_flags);
+
+	if (!hard && !soft)
+		return ESP_SDIO_RESET_NONE;
+
+	if (request_epoch != epoch || healthy) {
+		/* Clear ONLY the request observed under both locks; a request
+		 * for epoch+1 cannot be published until we release the locks. */
+		atomic_set(&sdio_hard_reset_requested, 0);
+		atomic_set(&sdio_soft_reset_requested, 0);
+		return ESP_SDIO_RESET_STALE;
+	}
+
+	/* A claim wins against a concurrent successful boot commit. Quarantine
+	 * this incarnation before releasing either lock so finish_reconstruction
+	 * cannot publish it as healthy while the worker performs the reset.
+	 * Bump the generation so an earlier reconstruction cannot clear these
+	 * flags even if its boot handler finishes while we reset the bus. */
+	set_bit(ESP_FW_RECOVERY_PENDING, &adapter->state_flags);
+	set_bit(ESP_FW_RESET_EXPECTED, &adapter->state_flags);
+	atomic_inc(&adapter->fw_recovery_gen);
+
+	if (hard) {
+		atomic_set(&sdio_hard_reset_requested, 0);
+		/* A DT hardware request supersedes a queued software request. */
+		atomic_set(&sdio_soft_reset_requested, 0);
+		return ESP_SDIO_RESET_HARD;
+	}
+	atomic_set(&sdio_soft_reset_requested, 0);
+	return ESP_SDIO_RESET_SOFT;
+}
+
+static enum esp_sdio_reset_claim
+esp_sdio_claim_reset_request(struct esp_adapter *adapter)
+{
+	unsigned long flags;
+	enum esp_sdio_reset_claim claim;
+
+	spin_lock_irqsave(&adapter->fw_recovery_lock, flags);
+	spin_lock(&sdio_reset_budget_lock);
+	claim = esp_sdio_claim_reset_locked(adapter);
+	spin_unlock(&sdio_reset_budget_lock);
+	spin_unlock_irqrestore(&adapter->fw_recovery_lock, flags);
+	return claim;
+}
+
 static u8 sdio_reset_gen;
 
 static int tx_process(void *data);
@@ -589,6 +741,11 @@ static void esp_remove(struct sdio_func *func)
 	sdio_buf_available = 0;
 	atomic_set(&sdio_need_counter_rebase, 0);
 	atomic_set(&sdio_need_slave_reset, 0);
+	atomic_set(&sdio_hard_reset_requested, 0);
+	atomic_set(&sdio_soft_reset_requested, 0);
+	atomic_set(&sdio_reset_request_epoch, 0);
+	esp_sdio_soft_reset_budget_drop();
+	atomic_set(&sdio_hard_reset_unavailable, 0);
 
 	esp_dbg("ESP SDIO cleanup completed\n");
 }
@@ -697,6 +854,8 @@ static int esp_sdio_reinit_after_fw_reset(struct esp_adapter *adapter)
 	if (ret)
 		return ret;
 
+	/* A parsed boot TLV does not prove WLAN/BT/RCP publish succeeded.
+	 * Only commit_fw_recovery replenishes this retry budget. */
 	tx_thread = kthread_run(tx_process, adapter, "esp_TX");
 	if (IS_ERR(tx_thread)) {
 		ret = PTR_ERR(tx_thread);
@@ -706,6 +865,22 @@ static int esp_sdio_reinit_after_fw_reset(struct esp_adapter *adapter)
 	}
 
 	return 0;
+}
+
+static void esp_sdio_commit_fw_recovery(struct esp_adapter *adapter)
+{
+	unsigned long flags;
+
+	/* Always synchronize the budget with the newly committed incarnation,
+	 * even when a *new* reset request has already arrived. Earlier code
+	 * returned on request-epoch match and incorrectly retained the previous
+	 * incarnation's exhausted soft-reset attempt counter.
+	 *
+	 * Hold the same lock as reset_target(): a request that arrives just
+	 * after boot commit keeps its intent while starting from attempt zero. */
+	spin_lock_irqsave(&sdio_reset_budget_lock, flags);
+	esp_sdio_commit_reset_budget_locked(adapter);
+	spin_unlock_irqrestore(&sdio_reset_budget_lock, flags);
 }
 
 static void esp_sdio_note_fw_reset(struct esp_adapter *adapter)
@@ -953,6 +1128,11 @@ static int esp_sdio_mmc_hw_reset(struct sdio_func *func)
 {
 	if (!func || !func->card)
 		return -ENODEV;
+	/* mmc_hw_reset() without pwrseq may only reinitialize the SDIO bus,
+	 * leaving the running ESP firmware untouched. Never count that as an
+	 * out-of-band firmware restart. */
+	if (!func->card->host->pwrseq)
+		return -EOPNOTSUPP;
 
 	/*
 	 * mmc_hw_reset() took struct mmc_host * through Linux 5.17 and
@@ -963,6 +1143,47 @@ static int esp_sdio_mmc_hw_reset(struct sdio_func *func)
 #else
 	return mmc_hw_reset(func->card->host);
 #endif
+}
+
+/* Request a real EN reset only when Device Tree has a bound MMC pwrseq.
+ * The recovery worker serializes the operation with all SDIO traffic.
+ * Absence must fall through to an acknowledged in-band reboot. */
+static int esp_sdio_reset_target(struct esp_adapter *adapter)
+{
+	struct esp_sdio_context *context;
+	unsigned long flags;
+	int ret = 0;
+
+	if (!adapter || !(context = adapter->if_context) ||
+	    !context->func || !context->func->card)
+		return -ENODEV;
+	if (test_bit(ESP_DRIVER_UNLOADING, &adapter->state_flags) ||
+	    test_bit(ESP_TRANSPORT_REMOVING, &adapter->state_flags))
+		return -ESHUTDOWN;
+	/* Commit callback and new requests share this lock. New incarnation
+	 * counters are rebased before checking their local attempt cap, and
+	 * preserving a new request never preserves an old exhausted counter. */
+	spin_lock_irqsave(&sdio_reset_budget_lock, flags);
+	esp_sdio_reset_budget_sync_locked(adapter);
+	if (!atomic_read(&sdio_hard_reset_unavailable) &&
+	    context->func->card->host->pwrseq) {
+		atomic_set(&sdio_reset_request_epoch,
+			   atomic_read(&adapter->fw_boot_commit_epoch));
+		atomic_set(&sdio_hard_reset_requested, 1);
+	} else if (atomic_read(&sdio_soft_reset_attempts) >=
+		   ESP_FW_BOOT_MAX_ATTEMPTS) {
+		ret = -EHOSTUNREACH;
+	} else {
+		/* No bound DT reset provider: send an ACKed CLOSE_DATA_PATH. */
+		atomic_set(&sdio_reset_request_epoch,
+			   atomic_read(&adapter->fw_boot_commit_epoch));
+		atomic_set(&sdio_soft_reset_requested, 1);
+	}
+	spin_unlock_irqrestore(&sdio_reset_budget_lock, flags);
+	if (ret)
+		return ret;
+	esp_schedule_fw_reset_recovery(adapter);
+	return 0;
 }
 
 static int esp_sdio_hard_reset_and_reopen(struct esp_adapter *adapter,
@@ -1012,6 +1233,7 @@ static int esp_sdio_hard_reset_and_reopen(struct esp_adapter *adapter,
 		return -EAGAIN;
 	}
 	if (ret < 0) {
+		atomic_set(&sdio_hard_reset_unavailable, 1);
 		esp_err("SDIO recover: MMC hard reset failed %d; falling back to firmware restart\n", ret);
 		/*
 		 * Some MMC hosts have no usable hardware-reset/pwrseq operation.
@@ -1060,6 +1282,7 @@ static int esp_sdio_hard_reset_and_reopen(struct esp_adapter *adapter,
 static int esp_sdio_recover_transport_inner(struct esp_adapter *adapter)
 {
 	struct esp_sdio_context *context;
+	enum esp_sdio_reset_claim reset_claim;
 	u32 raw_len, delta;
 	int ret;
 	bool fw_reset;
@@ -1079,12 +1302,79 @@ static int esp_sdio_recover_transport_inner(struct esp_adapter *adapter)
 
 	cancel_delayed_work_sync(&context->rx_len_retry_work);
 
+	/* Claim before quiescing TX or taking the potentially slow MMC epoch
+	 * barrier. A late completed boot or new reset request cannot interleave
+	 * between the epoch test and consuming the reset intent. */
+	reset_claim = esp_sdio_claim_reset_request(adapter);
+	if (reset_claim == ESP_SDIO_RESET_STALE &&
+	    test_bit(ESP_INIT_DONE, &adapter->state_flags) &&
+	    !test_bit(ESP_FW_RECOVERY_PENDING, &adapter->state_flags) &&
+	    !test_bit(ESP_FW_RESET_EXPECTED, &adapter->state_flags))
+		return 1;
+
 	/* Block new TX commits first. Do not bump the epoch until this
 	 * thread owns the MMC host: a CMD53 already in mmc_wait_for_req
 	 * must still be allowed to update tx_buffer_count. */
 	atomic_set(&adapter->state, ESP_CONTEXT_RX_READY);
 	wake_up(&context->tx_waitq);
 	esp_sdio_epoch_barrier(context);
+
+	/* Validation, stale cleanup, and claim were performed atomically
+	 * against both common boot commit and reset_target publication.
+	 * Only now, after dropping spinlocks, can the worker touch MMC. */
+	if (reset_claim == ESP_SDIO_RESET_STALE) {
+		if (test_bit(ESP_INIT_DONE, &adapter->state_flags) &&
+		    !test_bit(ESP_FW_RECOVERY_PENDING, &adapter->state_flags) &&
+		    !test_bit(ESP_FW_RESET_EXPECTED, &adapter->state_flags)) {
+			atomic_set(&adapter->state, ESP_CONTEXT_READY);
+			return 1;
+		}
+	}
+
+	if (reset_claim == ESP_SDIO_RESET_HARD)
+		return esp_sdio_hard_reset_and_reopen(adapter, context,
+					"DT power-sequence reset requested");
+
+	if (reset_claim == ESP_SDIO_RESET_SOFT) {
+		/*
+		 * Without DT pwrseq use a numbered CLOSE_DATA_PATH handshake
+		 * instead of treating CMD52 interrupt submission as an ACK.
+		 * The firmware publishes RESET_DONE before calling esp_restart().
+		 * Never reopen until reboot has had time to start; success
+		 * still requires a new boot TLV in the common recovery path.
+		 */
+		ret = esp_sdio_reenable_func(context);
+		if (ret)
+			return ret;
+		/* Consume a local attempt in the current commit epoch. A completed
+		 * boot (not merely a parsed TLV/ACK) starts a fresh local budget. */
+		if (!esp_sdio_soft_reset_budget_take(adapter))
+			return -EHOSTUNREACH;
+		ret = esp_sdio_handshake_slave_reset(context, ESP_CLOSE_DATA_PATH);
+		if (ret) {
+			/* Failed requests still consume a retry opportunity. */
+			esp_err("SDIO software reboot was not acknowledged: %d\n", ret);
+			return ret;
+		}
+		/* ACK means firmware accepted the request, not that a new
+		 * incarnation or all endpoints were published. Keep this attempt
+		 * consumed until full committed reconstruction. */
+		clear_bit(ESP_FW_RESTART_NEEDED, &adapter->state_flags);
+		set_bit(ESP_FW_RESET_EXPECTED, &adapter->state_flags);
+		/* esp_restart() also clears slave PACKET_LEN and TOKEN. The old
+		 * host RX cursor must not skip the new boot TLV, exactly as for
+		 * a physical EN reset. */
+		sdio_purge_tx_queues(context);
+		skb_queue_purge(&context->rx_q);
+		context->rx_byte_count = 0;
+		context->tx_buffer_count = 0;
+		sdio_buf_available = 0;
+		atomic_set(&context->rx_pending, 0);
+		context->rx_len_retry_count = 0;
+		atomic_set(&sdio_need_counter_rebase, 1);
+		msleep(180);
+		return esp_sdio_open_and_poll(adapter, context);
+	}
 
 	ret = esp_sdio_reenable_func(context);
 	if (ret) {
@@ -1099,19 +1389,12 @@ static int esp_sdio_recover_transport_inner(struct esp_adapter *adapter)
 	fw_reset = test_bit(ESP_FW_RESET_EXPECTED, &adapter->state_flags);
 
 	if (test_bit(ESP_FW_RESTART_NEEDED, &adapter->state_flags)) {
-		/* Transport communication has just been restored by esp_sdio_reenable_func.
-		 * Deliver the deferred CLOSE_DATA_PATH restart interrupt to firmware now
-		 * before waiting for reboot and a new boot TLV. */
-		ret = generate_slave_intr(context, BIT(ESP_CLOSE_DATA_PATH));
-		if (ret) {
-			esp_err("SDIO recover: retry CLOSE_DATA_PATH failed %d; trying MMC hard reset\n", ret);
-			return esp_sdio_hard_reset_and_reopen(adapter, context,
-					"CLOSE_DATA_PATH failed");
-		}
-		clear_bit(ESP_FW_RESTART_NEEDED, &adapter->state_flags);
-		set_bit(ESP_FW_RESET_EXPECTED, &adapter->state_flags);
-		fw_reset = true;
-		msleep(100);
+		/* An earlier ACK attempt may have timed out. Never bypass the
+		 * acknowledged-reboot protocol by sending a bare CLOSE interrupt.
+		 * Retry through the serialized generation handshake, with a cap. */
+		if (!esp_sdio_soft_reset_budget_arm(adapter))
+			return -EHOSTUNREACH;
+		return -EAGAIN;
 	}
 
 	if (fw_reset)
@@ -1313,6 +1596,8 @@ static struct esp_if_ops if_ops = {
 	.alloc_skb	= esp_sdio_alloc_skb,
 	.quiesce_for_fw_reset = esp_sdio_quiesce_for_fw_reset,
 	.reinit_after_fw_reset = esp_sdio_reinit_after_fw_reset,
+	.commit_fw_recovery = esp_sdio_commit_fw_recovery,
+	.reset_target = esp_sdio_reset_target,
 	.recover_transport = esp_sdio_recover_transport,
 	.note_fw_reset	= esp_sdio_note_fw_reset,
 	.flush_bt_traffic = esp_sdio_flush_bt_traffic,
@@ -1360,18 +1645,24 @@ static int init_context(struct esp_sdio_context *context)
 		return -EINVAL;
 	}
 
-	/* Cached host credits belong to one firmware/physical binding only.
-	 * Function enumeration can race a peripheral that is just becoming ready,
-	 * so tolerate a few transient register-read failures before refusing probe. */
+	/*
+	 * A freshly bound host must not set its RX consumer to the currently
+	 * published PACKET_LEN: that can skip the firmware's already-queued
+	 * boot TLV and wrongly force a reboot. The singleton was zeroed on
+	 * previous removal; start consuming its first incarnation at zero.
+	 * Get TX credits separately. The accepted boot event later invokes
+	 * get_firmware_data() to establish the new running-session baselines.
+	 */
 	sdio_buf_available = 0;
+	context->rx_byte_count = 0;
 	{
 		int attempt;
 
 		for (attempt = 0; attempt < ESP_SDIO_PROBE_IO_RETRIES; attempt++) {
-			ret = get_firmware_data(context);
+			ret = esp_sdio_baseline_tx_credits(context);
 			if (!ret)
 				break;
-			esp_warn("Initial SDIO baseline failed %d (attempt %d/%d)\n",
+			esp_warn("Initial SDIO credits unavailable %d (attempt %d/%d)\n",
 				 ret, attempt + 1, ESP_SDIO_PROBE_IO_RETRIES);
 			if (attempt + 1 < ESP_SDIO_PROBE_IO_RETRIES)
 				msleep(20);

@@ -83,10 +83,14 @@ enum adapter_flags_e {
 	ESP_TRANSPORT_REMOVING,     /* physical transport removal: reject new work/recovery */
 	ESP_SKIP_FW_DEINIT,         /* scoped local-only netdev teardown */
 	ESP_FW_RESTART_NEEDED,      /* firmware restart requested but not yet confirmed sent */
+	ESP_FW_RECOVERY_EXHAUSTED,  /* terminal: no more automatic reboot after retry cap */
+	ESP_FW_RADIO_INIT_PENDING,  /* budget held until runtime-radio convergence */
 };
 
 #define ESP_FW_RECOVERY_QUIET_MS        500
 #define ESP_FW_RECOVERY_WATCHDOG_MS     3000
+#define ESP_FW_BOOT_ACK_TIMEOUT_MS      9000
+#define ESP_FW_BOOT_MAX_ATTEMPTS       3
 #define ESP_FW_RECOVERY_BACKOFF_MAX_MS  5000
 #define ESP_OTA_RECOVERY_DELAY_MS       2000
 
@@ -172,6 +176,11 @@ struct esp_adapter {
 	unsigned int            fw_recovery_backoff_ms;
 	atomic_t                fw_recovery_gen;
 	u32                     fw_reconstruct_gen;
+	/* Under fw_recovery_lock: requested reset -> fresh committed boot. */
+	unsigned int            fw_boot_reset_attempts;
+	unsigned long           fw_boot_deadline;
+	/* Commit epoch invalidates transport-specific queued reset requests. */
+	atomic_t                fw_boot_commit_epoch;
 
 	unsigned long           state_flags;
 	int                     chipset;

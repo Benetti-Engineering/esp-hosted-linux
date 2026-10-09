@@ -19,6 +19,8 @@ struct esp_if_ops {
 	struct sk_buff* (*alloc_skb)(u32 len);
 	int (*quiesce_for_fw_reset)(struct esp_adapter *adapter);
 	int (*reinit_after_fw_reset)(struct esp_adapter *adapter);
+	/* Called only after Wi-Fi and secondary-radio publication succeeded. */
+	void (*commit_fw_recovery)(struct esp_adapter *adapter);
 	/*
 	 * Request the transport-owned hardware reset, when available.
 	 * Return 0 once the request is accepted; completion is asynchronous and
