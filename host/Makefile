@@ -21,6 +21,7 @@ MODULE_NAME := esp32_$(target)
 # Device Tree overlay compiler and generated Raspberry Pi SPI overlays.
 DTC ?= dtc
 SPI_DTBOS := spidev_disabler.dtbo overlays/esp32-spi.dtbo
+SDIO_DTBOS := overlays/esp32-sdio-pwrseq.dtbo
 
 # Debug and AP support
 # NOTE: use ccflags-y (not EXTRA_CFLAGS) for -D defines. Modern kbuild
@@ -68,12 +69,14 @@ $(MODULE_NAME)-y := $(module_objects)
 
 # Build targets
 .DELETE_ON_ERROR:
-.PHONY: all clean check spi-dtbo
+.PHONY: all clean check spi-dtbo sdio-dtbo
 
 all: clean
 	$(MAKE) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) -C $(KERNEL) M=$(PWD) modules
 
 spi-dtbo: $(SPI_DTBOS)
+
+sdio-dtbo: $(SDIO_DTBOS)
 
 spidev_disabler.dtbo: spidev_disabler.dts
 	$(DTC) -@ -I dts -O dtb -o $@ $<
@@ -81,9 +84,12 @@ spidev_disabler.dtbo: spidev_disabler.dts
 overlays/esp32-spi.dtbo: overlays/esp32-spi.dts
 	$(DTC) -@ -I dts -O dtb -o $@ $<
 
+overlays/esp32-sdio-pwrseq.dtbo: overlays/esp32-sdio-pwrseq.dts
+	$(DTC) -@ -I dts -O dtb -o $@ $<
+
 clean:
 	rm -rf *.o */*.o *.ko *.mod.c *.symvers *.order .*.cmd .tmp_versions
-	rm -f $(SPI_DTBOS)
+	rm -f $(SPI_DTBOS) $(SDIO_DTBOS)
 	$(MAKE) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) -C $(KERNEL) M=$(PWD) clean
 
 check:

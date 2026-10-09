@@ -1,0 +1,48 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Raspberry Pi ESP-Hosted SDIO reset power-sequence overlay.
+ *
+ * Apply this at boot together with the Raspberry Pi "sdio" overlay. The
+ * MMC core then owns ESP EN/reset and can toggle it during initial card
+ * enumeration and mmc_hw_reset() recovery.
+ */
+
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "brcm,bcm2835";
+
+	fragment@0 {
+		target-path = "/";
+
+		__overlay__ {
+			esp_sdio_pwrseq: esp-sdio-pwrseq {
+				compatible = "mmc-pwrseq-simple";
+				/* ESP EN/reset, active low. */
+				reset-gpios = <&gpio 6 1>;
+				/*
+				 * The ESP32-C6 SDIO function is not reliably CMD52-ready
+				 * with the historical 200 ms EN-release delay. Linux 6.1.21
+				 * MMC hard-reset and live Wi-Fi recovery were qualified
+				 * with a 1500 ms power-on settling interval (PR #125).
+				 * BSPs can override resetdelay for their own hardware.
+				 */
+				post-power-on-delay-ms = <1500>;
+			};
+		};
+	};
+
+	fragment@1 {
+		target = <&mmc>;
+
+		__overlay__ {
+			mmc-pwrseq = <&esp_sdio_pwrseq>;
+		};
+	};
+
+	__overrides__ {
+		resetgpio = <&esp_sdio_pwrseq>,"reset-gpios:4";
+		resetdelay = <&esp_sdio_pwrseq>,"post-power-on-delay-ms:0";
+	};
+};

@@ -949,6 +949,114 @@ static int esp_sdio_open_and_poll(struct esp_adapter *adapter,
 	return 0;
 }
 
+static int esp_sdio_mmc_hw_reset(struct sdio_func *func)
+{
+	if (!func || !func->card)
+		return -ENODEV;
+
+	/*
+	 * mmc_hw_reset() took struct mmc_host * through Linux 5.17 and
+	 * struct mmc_card * from Linux 5.18 onward.
+	 */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 18, 0)
+	return mmc_hw_reset(func->card);
+#else
+	return mmc_hw_reset(func->card->host);
+#endif
+}
+
+static int esp_sdio_hard_reset_and_reopen(struct esp_adapter *adapter,
+		struct esp_sdio_context *context, const char *reason)
+{
+	struct sdio_func *func;
+	int ret;
+
+	if (!adapter || !context || !context->func || !context->func->card)
+		return -ENODEV;
+	if (test_bit(ESP_DRIVER_UNLOADING, &adapter->state_flags) ||
+	    test_bit(ESP_TRANSPORT_REMOVING, &adapter->state_flags))
+		return -ESHUTDOWN;
+
+	func = context->func;
+
+	/*
+	 * Publish the new-incarnation expectation before resetting the card.
+	 * mmc_hw_reset() executes the SDIO bus hard-reset operation. For a
+	 * single-function SDIO card Linux power-cycles the MMC host/card and
+	 * reinitializes the same card. If the MMC host has an
+	 * mmc-pwrseq-simple provider, its reset-gpios line is asserted during
+	 * that power cycle, giving us an out-of-band ESP EN reset.
+	 */
+	set_bit(ESP_FW_RESET_EXPECTED, &adapter->state_flags);
+	clear_bit(ESP_FW_RESTART_NEEDED, &adapter->state_flags);
+	atomic_set(&sdio_need_counter_rebase, 1);
+	atomic_set(&sdio_need_slave_reset, 0);
+	sdio_purge_tx_queues(context);
+	skb_queue_purge(&context->rx_q);
+	sdio_buf_available = 0;
+
+	esp_info("SDIO recover: MMC hard reset (%s)\n",
+		 reason ? reason : "transport failure");
+
+	sdio_claim_host(func);
+	ret = esp_sdio_mmc_hw_reset(func);
+	sdio_release_host(func);
+
+	/*
+	 * SDIO cards with more than one probed function may schedule an
+	 * asynchronous remove/rescan and return 1. ESP-Hosted normally uses
+	 * one function, but do not touch the old function object in that case.
+	 */
+	if (ret > 0) {
+		esp_info("SDIO recover: MMC hard reset scheduled asynchronously\n");
+		return -EAGAIN;
+	}
+	if (ret < 0) {
+		esp_err("SDIO recover: MMC hard reset failed %d; falling back to firmware restart\n", ret);
+		/*
+		 * Some MMC hosts have no usable hardware-reset/pwrseq operation.
+		 * Preserve the existing in-band firmware restart path rather than
+		 * making optional DT support mandatory for recovery on those boards.
+		 * This also re-publishes the restart request after the failed
+		 * hard-reset attempt consumed ESP_FW_RESTART_NEEDED.
+		 */
+		esp_schedule_fw_reset_recovery(adapter);
+		esp_request_firmware_restart(adapter);
+		return ret;
+	}
+
+	/*
+	 * MMC hardware reset restarts the slave's cumulative PACKET_LEN and
+	 * TOKEN counters at zero. Keep the host RX consumer at zero until
+	 * the new boot TLV has been read; get_firmware_data() here would
+	 * instead advance it past that very boot event, losing the only
+	 * publication of the fresh firmware session.
+	 *
+	 * Recovery owns the TX epoch barrier and has purged stale queues.
+	 * Reset pending hints too: IRQ publication from the old incarnation
+	 * must not be treated as a new packet.
+	 */
+	esp_info("SDIO recover: MMC reset host counters rx=%u -> 0 tx=%u -> 0\n",
+		 context->rx_byte_count, context->tx_buffer_count);
+	context->rx_byte_count = 0;
+	context->tx_buffer_count = 0;
+	atomic_set(&context->rx_pending, 0);
+	context->rx_len_retry_count = 0;
+
+	/*
+	 * The card itself has been reinitialized by the MMC core, but the
+	 * function and its IRQ need to be enabled again for this driver.
+	 */
+	ret = esp_sdio_reenable_func(context);
+	if (ret) {
+		esp_err("SDIO recover: re-enable after MMC hard reset failed %d\n",
+			ret);
+		return ret;
+	}
+
+	return esp_sdio_open_and_poll(adapter, context);
+}
+
 static int esp_sdio_recover_transport_inner(struct esp_adapter *adapter)
 {
 	struct esp_sdio_context *context;
@@ -983,8 +1091,9 @@ static int esp_sdio_recover_transport_inner(struct esp_adapter *adapter)
 		if (test_bit(ESP_FW_RESET_EXPECTED, &context->adapter->state_flags) ||
 		    atomic_read(&sdio_need_counter_rebase))
 			atomic_set(&sdio_need_counter_rebase, 1);
-		esp_err("SDIO recover: re-enable function failed %d\n", ret);
-		return ret;
+		esp_err("SDIO recover: re-enable function failed %d; trying MMC hard reset\n", ret);
+		return esp_sdio_hard_reset_and_reopen(adapter, context,
+				"function re-enable failed");
 	}
 
 	fw_reset = test_bit(ESP_FW_RESET_EXPECTED, &adapter->state_flags);
@@ -995,8 +1104,9 @@ static int esp_sdio_recover_transport_inner(struct esp_adapter *adapter)
 		 * before waiting for reboot and a new boot TLV. */
 		ret = generate_slave_intr(context, BIT(ESP_CLOSE_DATA_PATH));
 		if (ret) {
-			esp_err("SDIO recover: retry CLOSE_DATA_PATH failed %d; will retry\n", ret);
-			return ret;
+			esp_err("SDIO recover: retry CLOSE_DATA_PATH failed %d; trying MMC hard reset\n", ret);
+			return esp_sdio_hard_reset_and_reopen(adapter, context,
+					"CLOSE_DATA_PATH failed");
 		}
 		clear_bit(ESP_FW_RESTART_NEEDED, &adapter->state_flags);
 		set_bit(ESP_FW_RESET_EXPECTED, &adapter->state_flags);
@@ -1012,22 +1122,16 @@ static int esp_sdio_recover_transport_inner(struct esp_adapter *adapter)
 		 * only after RESET_DONE matches this generation. */
 		ret = esp_sdio_handshake_slave_reset(context, ESP_RESET);
 		if (ret) {
-			esp_err("SDIO recover: ESP_RESET handshake failed %d; escalating\n", ret);
-			/*
-			 * Quarantine the current incarnation before issuing CLOSE.
-			 * This preserves the same publish-before-restart ordering used
-			 * by the generic recovery path.
-			 */
-			esp_schedule_fw_reset_recovery(adapter);
-			esp_request_firmware_restart(adapter);
-			atomic_set(&sdio_need_counter_rebase, 1);
-			return ret;
+			esp_err("SDIO recover: ESP_RESET handshake failed %d; trying MMC hard reset\n", ret);
+			return esp_sdio_hard_reset_and_reopen(adapter, context,
+					"in-band ESP_RESET failed");
 		}
 		ret = esp_sdio_rebase_incarnation(context);
 		if (ret) {
 			atomic_set(&sdio_need_slave_reset, 1);
-			esp_err("SDIO recover: post-ESP_RESET rebase failed %d\n", ret);
-			return ret;
+			esp_err("SDIO recover: post-ESP_RESET rebase failed %d; trying MMC hard reset\n", ret);
+			return esp_sdio_hard_reset_and_reopen(adapter, context,
+					"post-ESP_RESET rebase failed");
 		}
 		if (test_bit(ESP_INIT_DONE, &adapter->state_flags)) {
 			sdio_buf_available = 0;
@@ -1046,8 +1150,9 @@ static int esp_sdio_recover_transport_inner(struct esp_adapter *adapter)
 			ret = esp_sdio_rebase_incarnation(context);
 			if (ret) {
 				atomic_set(&sdio_need_counter_rebase, 1);
-				esp_err("SDIO recover: rebase counters failed %d\n", ret);
-				return ret;
+				esp_err("SDIO recover: rebase counters failed %d; trying MMC hard reset\n", ret);
+				return esp_sdio_hard_reset_and_reopen(adapter, context,
+						"counter rebase failed");
 			}
 		}
 		fw_reset = true;
@@ -1069,8 +1174,9 @@ static int esp_sdio_recover_transport_inner(struct esp_adapter *adapter)
 	ret = esp_sdio_read_u32(context, ESP_SLAVE_PACKET_LEN_REG,
 				context->rx_len_buf, &raw_len, ACQUIRE_LOCK);
 	if (ret) {
-		esp_err("SDIO recover: PACKET_LEN resync failed %d\n", ret);
-		return ret;
+		esp_err("SDIO recover: PACKET_LEN resync failed %d; trying MMC hard reset\n", ret);
+		return esp_sdio_hard_reset_and_reopen(adapter, context,
+				"PACKET_LEN resync failed");
 	}
 
 	raw_len &= ESP_SLAVE_LEN_MASK;
@@ -1095,8 +1201,9 @@ static int esp_sdio_recover_transport_inner(struct esp_adapter *adapter)
 		 * emits a boot TLV that the boot handler will reconstruct. */
 		ret = generate_slave_intr(context, BIT(ESP_OPEN_DATA_PATH));
 		if (ret) {
-			esp_err("SDIO recover: OPEN probe failed %d\n", ret);
-			return ret;
+			esp_err("SDIO recover: OPEN probe failed %d; trying MMC hard reset\n", ret);
+			return esp_sdio_hard_reset_and_reopen(adapter, context,
+					"OPEN probe failed");
 		}
 		/* Keep the live consumer pointer. Only drop the cached
 		 * availability so the next TX re-reads TOKEN. */
