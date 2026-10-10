@@ -7,7 +7,7 @@ the production source of truth for:
 - `compatible = "espressif,esp32-spi"`
 - `spi-max-frequency`
 - standard SPI mode properties `spi-cpol` / `spi-cpha` (the example is mode 2)
-- `reset-gpios` (required)
+- `reset-gpios` (optional in the driver; present in this reference overlay)
 - `handshake-gpios` (required)
 - `data-ready-gpios` (required)
 
@@ -26,8 +26,11 @@ requested transport first, unloads a currently loaded ESP-Hosted transport,
 replaces only its runtime SPI overlays, loads the freshly built module, and
 checks that `spi0.0` binds. It intentionally does not implement persistent
 rollback/provenance tracking; it is a bring-up/test helper rather than a
-deployment manager. The Raspberry Pi SDIO boot overlay is not removed, so it
-can remain active when the SPI control GPIOs use different pins.
+deployment manager. Boot-time SDIO configuration is not removed dynamically:
+the helper inspects the live Raspberry Pi SDIO pin group and ESP pwrseq reset
+GPIO before enabling SPI. It refuses a real overlap with SPI0 or the selected
+ESP control GPIOs, and fails closed when an active custom SDIO configuration
+cannot be mapped safely.
 
 For a manual runtime flow, disable SPI **binding** auto-probe during the
 replacement window and preload the exact module before creating the ESP DT
@@ -95,26 +98,41 @@ sudo dtoverlay -d overlays esp32-spi \
 For the classic Raspberry Pi runtime overlay, `rpi_init.sh` accepts BCM GPIO
 numbers 0..53 but rejects GPIO7..GPIO11 because those pins are already consumed
 by SPI0 chip-select/MISO/MOSI/SCLK. Reset, handshake, and data-ready must also
-be three distinct GPIOs. An SDIO overlay using GPIO22..27 may remain active if
-the selected SPI control GPIOs do not overlap those pins.
+be three distinct GPIOs. The default SPI and SDIO mappings overlap (SDIO
+GPIO22..27 versus SPI Handshake/Data Ready, plus BCM6 when the default SDIO
+pwrseq and SPI reset are both used). Alternate SDIO pin groups can coexist with
+SPI when the live SDIO data pins, pwrseq reset GPIO, SPI0 GPIO7..11, and the
+selected ESP control GPIOs are all disjoint. The helper checks that live set
+before applying the SPI overlay.
 
 GPIO polarity is part of each GPIO descriptor. The example uses active-low
 reset and active-high handshake/data-ready; the driver selects the matching
 physical IRQ edge from descriptor polarity. The example also declares
 `spi-cpol`, so the SPI core supplies mode 2 (CPOL=1, CPHA=0) to the driver.
 
-`spi-max-frequency` is a board/controller safety cap. The driver starts at
-its normal 10 MHz default unless `clockspeed` requests another rate, and
-clamps the requested rate to both the Device Tree maximum and the SPI
-protocol's 40 MHz maximum.
+`spi-max-frequency` is the board/controller safety cap. SPI bootstrap runs at
+the safe low rate; after a valid boot event the driver normally accepts the
+firmware-advertised operating clock, bounded by Device Tree and the protocol
+maximum. The legacy `clockspeed` module parameter remains an initial/fallback
+host rate, not a steady-state ceiling. If compatible firmware omits the optional
+clock TLV, the driver restores `clockspeed` when nonzero or the historical
+10 MHz default instead of remaining at the 1 MHz bootstrap rate.
 
 Unload `esp32_spi` before changing or removing a runtime overlay.
 
 For compatibility with older Raspberry Pi helper invocations,
 `rpi_init.sh spi resetpin=N` is accepted as an alias for `resetgpio=N`.
 The kernel module itself no longer accepts `resetpin=`; SPI reset ownership is
-described by `reset-gpios` in Device Tree. The helper's reset GPIO option has
-no effect on SDIO, whose post-enumeration reset/recovery is in-band.
+described by `reset-gpios` in Device Tree.
+
+For SDIO, `esp32-sdio-pwrseq.dtbo` describes a boot-time
+`mmc-pwrseq-simple` that controls ESP EN and marks the MMC host with
+`espressif,full-chip-reset`. The driver trusts MMC hardware reset as a firmware
+reincarnation only when both the pwrseq and this explicit marker are present.
+Because MMC pwrseq is acquired when the host is probed, install/apply this
+overlay in the boot configuration and reboot; do not rely on a late runtime
+overlay to retrofit reset ownership. Without the marker the driver safely uses
+the generation-ACKed in-band reboot fallback.
 
 
 ## Porting note

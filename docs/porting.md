@@ -5,7 +5,7 @@ ESP-Hosted-Linux is designed to integrate with Linux platforms that provide the 
 ## Porting checklist
 
 1. Pick SDIO, SPI, or USB and make sure Linux exposes that controller.
-2. For SPI, create an `espressif,esp32-spi` Device Tree node defining `reset-gpios`, `handshake-gpios`, and `data-ready-gpios`.
+2. For SPI, create an `espressif,esp32-spi` Device Tree node defining the required `handshake-gpios` and `data-ready-gpios`; add `reset-gpios` when the board exposes host-controlled ESP EN/reset.
 3. For SDIO, configure the MMC controller in Device Tree; add platform power-sequence reset (`mmc-pwrseq`) if required for enumeration.
 4. For USB, connect to a standard USB host controller; no Device Tree description is needed.
 5. Build the module against the target kernel tree.
@@ -38,9 +38,11 @@ Required and optional properties:
 - `reg`: The chip-select index on the SPI bus.
 - `spi-max-frequency`: The maximum bus clock rate in Hz (capped at 40 MHz by protocol).
 - `spi-cpol`: Present to select SPI mode 2 (CPOL=1, CPHA=0).
-- `reset-gpios`: Output GPIO descriptor connected to ESP reset/enable (active-low).
-- `handshake-gpios`: Interrupt-capable input GPIO descriptor for ESP Handshake (active-high).
-- `data-ready-gpios`: Interrupt-capable input GPIO descriptor for ESP Data Ready (active-high).
+- `reset-gpios` (optional): GPIO descriptor connected to ESP reset/enable (active-low). When present, it is the preferred authoritative recovery path.
+- `handshake-gpios` (required): Interrupt-capable input GPIO descriptor for ESP Handshake (active-high).
+- `data-ready-gpios` (required): Interrupt-capable input GPIO descriptor for ESP Data Ready (active-high).
+
+If `reset-gpios` is omitted, matching firmware must support the acknowledged SPI `CMD_HOST_REBOOT` fallback. The host sends that command at the boot-safe clock and treats reboot as accepted only after the matching checksummed ACK transaction completes.
 
 Example Device Tree snippet:
 
@@ -68,13 +70,17 @@ Ensure the pin controller (pinctrl) configures the SCLK, MOSI, MISO, and CS line
 
 ### SDIO platform integration
 
-SDIO recovery and link reset are handled entirely in-band after the SDIO function has enumerated.
+SDIO always supports the generation-ACKed in-band reboot path after enumeration.
+A board may additionally opt into full-chip MMC reset recovery when its
+power-sequence provider really toggles ESP EN/reset. In that case the MMC host
+must carry the explicit `espressif,full-chip-reset` marker; an arbitrary
+`mmc-pwrseq` is not assumed to create a new firmware incarnation.
 
 Map CLK, CMD, and DAT0-DAT3 to an MMC/SDIO controller in the platform Device Tree:
 
 - Add `non-removable` for hardwired modules.
 - Add `cap-sd-highspeed` if supported.
-- If the board requires host GPIO control to cycle power or toggle ESP reset before the SDIO card can enumerate, attach an `mmc-pwrseq-simple` node to the MMC controller:
+- If the board wants host-controlled ESP EN for enumeration and recovery, attach an `mmc-pwrseq-simple` node to the MMC controller and mark that controller as a full-chip reset provider:
 
 ```dts
 wifi_pwrseq: wifi-pwrseq {
@@ -88,6 +94,7 @@ wifi_pwrseq: wifi-pwrseq {
     non-removable;
     bus-width = <4>;
     mmc-pwrseq = <&wifi_pwrseq>;
+    espressif,full-chip-reset;
 };
 ```
 
@@ -138,7 +145,7 @@ Keep firmware settings and physical wiring in sync.
 
 Before raising clock speed:
 
-- confirm the host GPIO resets ESP
+- if a host reset GPIO is present, confirm that it resets ESP; otherwise confirm the acknowledged SPI reboot fallback is supported
 - make sure Linux can claim the intended SPI bus and CS
 - check Handshake and Data Ready interrupts
 - confirm both sides use SPI mode 2 unless you deliberately changed both
@@ -146,7 +153,7 @@ Before raising clock speed:
 - use short wiring
 - repeat boot and data transfers until they are clean
 
-The host starts at 10 MHz and can switch to the firmware-advertised SPI clock after boot information is received.
+The host uses the 1 MHz boot-safe clock for the initial/recovery exchange, then switches to the firmware-advertised operating clock. Compatible firmware without the optional clock TLV falls back to the configured initial rate or the historical 10 MHz default.
 
 ## SDIO bring-up
 

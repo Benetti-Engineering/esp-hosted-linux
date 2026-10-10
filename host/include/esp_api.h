@@ -50,6 +50,8 @@ void esp_schedule_recovery(struct esp_adapter *adapter,
 void esp_schedule_transport_recovery(struct esp_adapter *adapter);
 void esp_schedule_fw_reset_recovery(struct esp_adapter *adapter);
 void esp_request_firmware_restart(struct esp_adapter *adapter);
+void esp_reset_boot_recovery_for_binding(struct esp_adapter *adapter,
+		bool preserve_active_reset);
 
 
 #endif

@@ -87,7 +87,7 @@ sudo insmod ./esp32_usb.ko
 
 The commands above select the default secondary-radio service (`none`). If Bluetooth or Thread is needed immediately, add `radio_service=` to the one module command you use instead of inserting the module a second time.
 
-ESP-Hosted kernel drivers do not take a `resetpin=` module argument. For SDIO and USB, reset and recovery are handled in-band. For SPI, reset, Handshake, and Data Ready GPIOs are defined in Device Tree under the `espressif,esp32-spi` node (see [SPI Device Tree](../architecture/spi.md#device-tree-integration) and [Raspberry Pi reference](../reference/raspberry-pi.md)).
+ESP-Hosted kernel drivers do not take a `resetpin=` module argument. USB recovery is in-band. SDIO always has an acknowledged in-band reboot fallback and may additionally use a boot-time MMC pwrseq for full-chip ESP EN reset when the controller is explicitly marked `espressif,full-chip-reset`. For SPI, reset, Handshake, and Data Ready GPIOs are defined in Device Tree under the `espressif,esp32-spi` node (see [SPI Device Tree](../architecture/spi.md#device-tree-integration) and [Raspberry Pi reference](../reference/raspberry-pi.md)).
 
 Wi-Fi is independent of the secondary-radio selection. Current firmware keeps hosted Bluetooth and Thread off until requested with `radio_service`:
 

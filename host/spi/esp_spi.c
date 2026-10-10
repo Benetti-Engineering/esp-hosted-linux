@@ -56,6 +56,10 @@ static atomic_t spi_soft_reboot_attempts = ATOMIC_INIT(0);
 /* Reboot attempts are scoped to the committed firmware incarnation. */
 static DEFINE_SPINLOCK(spi_reboot_budget_lock);
 static u32 spi_reboot_budget_epoch;
+/* Boot-frame rescue is an initial-probe exception only. Once a firmware
+ * incarnation has committed, an explicit DT hardware reset must not be
+ * cancelled by an old/replayed BOOT frame still visible on the wire. */
+static bool spi_boot_rescue_pending;
 
 static void esp_spi_reboot_budget_sync_locked(struct esp_adapter *adapter)
 {
@@ -233,6 +237,51 @@ static void esp_spi_commit_fw_recovery(struct esp_adapter *adapter)
 	 * reset may have charged the next epoch already; never erase it. */
 	spin_lock_irqsave(&spi_reboot_budget_lock, flags);
 	esp_spi_reboot_budget_sync_locked(adapter);
+	/* Boot-first rescue is only for the uncommitted incarnation present
+	 * when the SPI device initially binds. */
+	spi_boot_rescue_pending = false;
+	spin_unlock_irqrestore(&spi_reboot_budget_lock, flags);
+}
+
+static bool esp_spi_claim_boot_rescue(void)
+{
+	unsigned long flags;
+	bool rescue;
+
+	spin_lock_irqsave(&spi_reboot_budget_lock, flags);
+	rescue = spi_boot_rescue_pending;
+	spi_boot_rescue_pending = false;
+	spin_unlock_irqrestore(&spi_reboot_budget_lock, flags);
+	return rescue;
+}
+
+static void esp_spi_arm_boot_rescue(void)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&spi_reboot_budget_lock, flags);
+	spi_boot_rescue_pending = true;
+	spin_unlock_irqrestore(&spi_reboot_budget_lock, flags);
+}
+
+static void esp_spi_retire_boot_rescue(void)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&spi_reboot_budget_lock, flags);
+	spi_boot_rescue_pending = false;
+	spin_unlock_irqrestore(&spi_reboot_budget_lock, flags);
+}
+
+static void esp_spi_reset_binding_budget(struct esp_adapter *adapter)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&spi_reboot_budget_lock, flags);
+	spi_reboot_budget_epoch =
+		adapter ? (u32)atomic_read(&adapter->fw_boot_commit_epoch) : 0;
+	atomic_set(&spi_soft_reboot_attempts, 0);
+	spi_boot_rescue_pending = false;
 	spin_unlock_irqrestore(&spi_reboot_budget_lock, flags);
 }
 
@@ -674,10 +723,14 @@ static void esp_spi_reset_work(struct work_struct *work)
 	int ret;
 
 	if (context->reset_gpio) {
-		/* A late boot event can arrive after the common watchdog fired
-		 * but before the ordered hardware reset is reached. Inspect the
-		 * SPI line once more at 1 MHz instead of destroying that event. */
-		ret = esp_spi_bootstrap_check_boot(adapter, &pending_boot, false);
+		/* Boot-first rescue applies only while the initial probe has never
+		 * committed an incarnation. Once Linux explicitly decides a running
+		 * incarnation must die, a queued/replayed BOOT frame cannot cancel
+		 * the requested physical reset. */
+		if (esp_spi_claim_boot_rescue())
+			ret = esp_spi_bootstrap_check_boot(adapter, &pending_boot, false);
+		else
+			ret = -ENODATA;
 		if (ret != 1)
 			ret = esp_spi_hw_reset(adapter);
 	} else {
@@ -706,11 +759,13 @@ static void esp_spi_reset_work(struct work_struct *work)
 			esp_err("SPI pending boot enqueue failed; preserving reset intent\n");
 		}
 	} else if (ret == 0 && !context->reset_gpio) {
-		/* Firmware ACK was clocked off the wire. It is now restarting;
-		 * the normal watcher will consume the next boot event. */
-		esp_info("SPI CMD_HOST_REBOOT wire ACK accepted; waiting for new boot TLV\n");
-		data_path = OPEN_DATAPATH;
-		esp_spi_kick();
+		/* The ACK only proves that firmware accepted CMD35. Its post-transfer
+		 * task deliberately restarts a little later. Keep the ordinary datapath
+		 * closed during that interval so old-incarnation HCI/RCP/internal frames
+		 * cannot cross the reincarnation boundary. recover_transport() reopens
+		 * SPI when it is time to wait for the fresh BOOT TLV. */
+		esp_info("SPI CMD_HOST_REBOOT wire ACK accepted; holding datapath closed for new boot TLV\n");
+		data_path = CLOSE_DATAPATH;
 	}
 
 	/*
@@ -1136,6 +1191,20 @@ static int process_rx_buf(struct sk_buff *skb, bool rx_pending)
 		esp_spi_fail_rcp_rx("invalid length/offset");
 		return -EINVAL;
 	}
+	/* The initial boot-first exception ends as soon as a BOOT frame is
+	 * actually consumed from the wire. If reconstruction later fails, the
+	 * ensuing explicit hardware reset is authoritative and cannot be cancelled
+	 * by another stale/replayed BOOT frame from the same incarnation. */
+	if (header->if_type == ESP_INTERNAL_IF &&
+	    header->packet_type == PACKET_TYPE_EVENT &&
+	    len >= sizeof(struct event_header)) {
+		const struct event_header *event =
+			(const struct event_header *)(skb->data + offset);
+
+		if (event->event_code == ESP_INTERNAL_BOOTUP_EVENT)
+			esp_spi_retire_boot_rescue();
+	}
+
 	len += offset;
 	skb_trim(skb, len);
 	if (!data_path) {
@@ -1412,9 +1481,14 @@ static int esp_spi_probe(struct spi_device *spi)
 		goto err_clear_dev;
 	}
 
+	/* clockspeed= is the historical initial/pre-negotiation host rate, not
+	 * a permanent ceiling on the firmware-advertised operating clock. Keep
+	 * the configured value only so a firmware that omits the optional clock
+	 * TLV can return from the 1 MHz boot-safe rate to the old startup rate. */
 	requested_hz = (u32)spi_context.requested_clk_mhz * NUMBER_1M;
-	if (requested_hz > spi_context.spi_max_hz)
-		esp_warn("SPI clock %u MHz exceeds Device Tree cap %u Hz; capping to %u MHz\n",
+	if (spi_context.requested_clk_mhz &&
+	    requested_hz > spi_context.spi_max_hz)
+		esp_warn("Initial SPI clock %u MHz exceeds Device Tree cap %u Hz; fallback will be limited to %u MHz\n",
 			 spi_context.requested_clk_mhz, spi_context.spi_max_hz, max_mhz);
 	/* Clock the pending boot event at 1 MHz regardless of the requested
 	 * steady-state rate. The validated boot TLV triggers negotiation. */
@@ -1544,7 +1618,12 @@ static int esp_spi_probe(struct spi_device *spi)
 		 SPI_BOOTSTRAP_CLK_MHZ,
 		 spi_context.reset_gpio ? "available" : "absent");
 
-	/* Preserve the existing firmware incarnation until proven stale. */
+	/* A reprobe is a fresh host binding, not a continuation of an exhausted
+	 * recovery episode. Reset both common and SPI-local retry budgets before
+	 * granting the one initial boot-first rescue token. */
+	esp_reset_boot_recovery_for_binding(spi_context.adapter, false);
+	esp_spi_reset_binding_budget(spi_context.adapter);
+	esp_spi_arm_boot_rescue();
 	clear_bit(ESP_INIT_DONE, &spi_context.adapter->state_flags);
 	clear_bit(ESP_FW_RECOVERY_PENDING, &spi_context.adapter->state_flags);
 	clear_bit(ESP_FW_RESET_EXPECTED, &spi_context.adapter->state_flags);
@@ -1785,10 +1864,9 @@ static void adjust_spi_clock(u8 spi_clk_mhz)
 		spi_clk_mhz = min_t(u32, max_mhz, 255U);
 	}
 
-	/* Board/customer cap and requested operating rate take precedence over
-	 * the firmware's advertised electrical maximum. */
-	if (spi_clk_mhz > spi_context.requested_clk_mhz)
-		spi_clk_mhz = spi_context.requested_clk_mhz;
+	/* Preserve master-compatible semantics: a valid firmware boot TLV owns
+	 * the steady-state rate. clockspeed= only selected the pre-negotiation
+	 * startup/fallback rate; Device Tree remains the board safety ceiling. */
 	if (spi_clk_mhz != spi_context.spi_clk_mhz) {
 		esp_info("ESP Reconfigure SPI CLK to %u MHz\n", spi_clk_mhz);
 		spi_context.spi_clk_mhz = spi_clk_mhz;
@@ -1799,6 +1877,15 @@ static void adjust_spi_clock(u8 spi_clk_mhz)
 
 int esp_adjust_spi_clock(struct esp_adapter *adapter, u8 spi_clk_mhz)
 {
+	if (!adapter || adapter != spi_context.adapter)
+		return -EINVAL;
+
+	/* Internal zero means the optional BOOT clock TLV was absent. Restore the
+	 * historical initial host rate instead of leaving recovery/bootstrap at
+	 * 1 MHz forever. A real firmware TLV of zero is rejected by main.c. */
+	if (!spi_clk_mhz)
+		spi_clk_mhz = spi_context.requested_clk_mhz ?
+			spi_context.requested_clk_mhz : SPI_INITIAL_CLK_MHZ;
 	adjust_spi_clock(spi_clk_mhz);
 	return 0;
 }
@@ -1823,8 +1910,11 @@ int esp_init_interface_layer(struct esp_adapter *adapter, u32 speed)
 			 speed, SPI_MAX_CLK_MHZ);
 		speed = SPI_MAX_CLK_MHZ;
 	}
-	spi_context.requested_clk_mhz = speed ? speed : SPI_INITIAL_CLK_MHZ;
-	spi_context.spi_clk_mhz = spi_context.requested_clk_mhz;
+	/* Preserve master semantics: clockspeed= selects only the initial host
+	 * rate. The BOOT clock TLV may later select a higher operating rate.
+	 * Store zero as "use historical 10 MHz fallback" after boot-safe receive. */
+	spi_context.requested_clk_mhz = speed;
+	spi_context.spi_clk_mhz = speed ? speed : SPI_INITIAL_CLK_MHZ;
 	return spi_init();
 }
 

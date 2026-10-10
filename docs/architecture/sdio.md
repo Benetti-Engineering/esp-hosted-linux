@@ -60,9 +60,19 @@ The host-sleep/wakeup implementation uses the SDIO power-save path plus a separa
 
 ## Reset and recovery
 
-ESP-Hosted SDIO does not accept or require a host GPIO module parameter (`resetpin=`). Once the SDIO function has enumerated, transport recovery and link reset use the in-band SDIO control protocol (`OPEN_DATA_PATH`, `CLOSE_DATA_PATH`, and the in-band SDIO reset handshake).
+ESP-Hosted SDIO does not accept a host GPIO module parameter (`resetpin=`).
+Recovery prefers a full-chip MMC reset only when the MMC host has both a bound
+power-sequence provider and the explicit Device Tree marker
+`espressif,full-chip-reset`. That marker is a board contract that
+`mmc_hw_reset()` toggles ESP EN/reset and therefore creates a new firmware
+incarnation; the presence of an arbitrary MMC pwrseq alone is not sufficient.
 
-If a custom board requires host-controlled power or reset before the SDIO function can enumerate, model that in the host platform's MMC Device Tree node (for example using `mmc-pwrseq-simple`).
+When that contract is absent, recovery uses the generation-ACKed in-band SDIO
+control protocol (`OPEN_DATA_PATH`, `CLOSE_DATA_PATH`, and the SDIO reset
+handshake). Boards that want host-controlled EN should model it in the MMC
+Device Tree (for example with `mmc-pwrseq-simple`) and add the explicit marker.
+On Raspberry Pi, `esp32-sdio-pwrseq.dtbo` provides this reference setup and
+must be active at boot so the MMC host acquires the pwrseq during probe.
 
 ## Hosted payload
 

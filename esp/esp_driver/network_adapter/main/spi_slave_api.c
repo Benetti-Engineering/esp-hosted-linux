@@ -710,10 +710,12 @@ static void spi_transaction_post_process_task(void* pvParameters)
     interface_buffer_handle_t rx_buf_handle = {0};
 
     for (;;) {
+        bool reboot_after_ack = false;
+
         memset(&rx_buf_handle, 0, sizeof(rx_buf_handle));
 
         /* Await transmission result, after any kind of transmission a new packet
-         * (dummy or real) must be placed in SPI slave
+         * (dummy or real) must normally be placed in SPI slave.
          */
         ret = spi_slave_get_trans_result(ESP_SPI_CONTROLLER, &spi_trans,
                                          portMAX_DELAY);
@@ -730,19 +732,30 @@ static void spi_transaction_post_process_task(void* pvParameters)
             xSemaphoreTake(wait_cs_deassert_sem, portMAX_DELAY);
         }
 #endif
-        /* Queue new transaction to get ready as soon as possible */
-        queue_next_transaction();
+
+        if (spi_trans && spi_trans->user) {
+            slot = (spi_slot_t *)spi_trans->user;
+            reboot_after_ack = slot->reboot_ack;
+        } else {
+            slot = NULL;
+        }
+
+        /* CMD35 is a reincarnation fence only after its ACK transaction
+         * completed successfully. If that transaction failed, no reboot was
+         * authorized and the slave must keep servicing SPI normally. */
+        if (ret != ESP_OK || !reboot_after_ack)
+            queue_next_transaction();
 
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "spi transmit error, ret : 0x%x\r\n", ret);
-            if (spi_trans && spi_trans->user) {
-                slot = (spi_slot_t *)spi_trans->user;
+            if (slot) {
                 if (slot->is_raw_tp) {
                     debug_raw_tp_tx_failed(1);
                 }
                 if (spi_trans->rx_buffer) {
                     recycle_spi_rx_buf((uint8_t *)spi_trans->rx_buffer);
                 }
+                slot->reboot_ack = false;
                 slot->in_use = false;
             }
             continue;
@@ -753,10 +766,24 @@ static void spi_transaction_post_process_task(void* pvParameters)
             continue;
         }
 
-        slot = (spi_slot_t *)spi_trans->user;
-
         if (slot && slot->is_raw_tp) {
             debug_raw_tp_tx_complete(1);
+        }
+
+        if (reboot_after_ack) {
+            /* Ignore the host MOSI side of the ACK-clocking transaction. It
+             * belongs to the old incarnation and must not cause new side effects
+             * while a full firmware restart is already committed. */
+            if (spi_trans->rx_buffer)
+                recycle_spi_rx_buf((uint8_t *)spi_trans->rx_buffer);
+            if (slot) {
+                slot->reboot_ack = false;
+                slot->in_use = false;
+            }
+            ESP_LOGW(TAG, "HOST_REBOOT ACK delivered over SPI; restarting firmware");
+            vTaskDelay(pdMS_TO_TICKS(50));
+            esp_restart();
+            continue;
         }
 
         if (spi_trans->rx_buffer) {
@@ -771,17 +798,8 @@ static void spi_transaction_post_process_task(void* pvParameters)
         }
 
         if (slot) {
-            bool reboot_after_ack = slot->reboot_ack;
             slot->reboot_ack = false;
             slot->in_use = false;
-            if (reboot_after_ack) {
-                /* This callback only runs after the master clocked the
-                 * complete ACK transaction. Never reboot on mere enqueue:
-                 * that could drop the command response on the wire. */
-                ESP_LOGW(TAG, "HOST_REBOOT ACK delivered over SPI; restarting firmware");
-                vTaskDelay(pdMS_TO_TICKS(50));
-                esp_restart();
-            }
         }
     }
 }

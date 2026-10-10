@@ -1,6 +1,6 @@
 # Hardware setup
 
-ESP-Hosted-Linux connects an ESP device to a Linux host over SDIO, SPI, or USB. SPI uses a host-controlled ESP reset/enable signal plus **Handshake** and **Data Ready** GPIOs. SDIO uses the MMC/SDIO bus and may need platform reset/power sequencing before enumeration. USB needs no sideband GPIOs.
+ESP-Hosted-Linux connects an ESP device to a Linux host over SDIO, SPI, or USB. SPI requires **Handshake** and **Data Ready** GPIOs and can optionally use host-controlled ESP reset/enable. SDIO uses the MMC/SDIO bus and may use platform reset/power sequencing for enumeration and full-chip recovery. USB needs no sideband GPIOs.
 
 SDIO, SPI, and UART GPIO signals use 3.3 V logic; do not connect them to 5 V GPIO logic without level shifting. USB D+/D- are USB differential signals and must be routed as USB, not as 3.3 V GPIOs.
 
@@ -21,7 +21,7 @@ The diagram shows external 10 kΩ pull-ups. Do not add duplicate resistors when 
 
 For bring-up, keep wiring short, provide a solid ground path, fit the required pull-ups, and lower the SDIO clock if transfers are unstable. Use a PCB or purpose-built interconnect for repeatable high-speed results.
 
-On the Linux host, configure the MMC/SDIO controller and pinctrl. Add an MMC power-sequence/reset GPIO only when the board needs it for initial enumeration; ESP-Hosted recovery is in-band after the SDIO function is present.
+On the Linux host, configure the MMC/SDIO controller and pinctrl. The generation-ACKed in-band reboot path is always available after enumeration. When an MMC power-sequence/reset GPIO really toggles ESP EN/reset, the controller may additionally be marked `espressif,full-chip-reset`; ESP-Hosted then prefers that full-chip reset for bounded recovery.
 
 </details>
 
@@ -127,8 +127,8 @@ Use a different UART for Bluetooth HCI when both UART radio interfaces are enabl
 
 Use a stable supply and power the ESP board through a supported board power input.
 
-- **SPI:** connect the host-controlled reset/enable GPIO required by the SPI Device Tree integration.
-- **SDIO:** connect reset/enable only when the platform uses it for MMC power sequencing or initial enumeration; normal post-enumeration recovery is in-band.
+- **SPI:** Handshake and Data Ready are required. Connect host-controlled reset/enable when the board exposes it; otherwise matching host/firmware can use the acknowledged in-band SPI reboot fallback.
+- **SDIO:** the acknowledged in-band reboot fallback is always available after enumeration. Connect reset/enable when the platform uses MMC power sequencing; with the explicit `espressif,full-chip-reset` contract it can also provide the preferred full-chip recovery path.
 - **USB:** no ESP reset GPIO is required by the hosted USB transport.
 - **All wired transports:** provide the required common ground through the board/interconnect.
 

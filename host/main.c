@@ -236,6 +236,38 @@ void esp_schedule_fw_reset_recovery(struct esp_adapter *adapter)
 	esp_schedule_recovery(adapter, ESP_FW_RECOVERY_QUIET_MS, false, true);
 }
 
+/* A physical driver binding is a new host-side recovery episode. SPI never
+ * re-enumerates as part of its own reset, so it always starts clean. SDIO may
+ * disappear/reprobe while mmc_hw_reset() is still the active counted attempt;
+ * preserve that episode only while its deadline is armed and it is not already
+ * terminal. */
+void esp_reset_boot_recovery_for_binding(struct esp_adapter *adapter,
+		bool preserve_active_reset)
+{
+	unsigned long flags;
+	bool active_reset;
+
+	if (!adapter)
+		return;
+
+	spin_lock_irqsave(&adapter->fw_recovery_lock, flags);
+	active_reset = adapter->fw_boot_deadline &&
+		test_bit(ESP_FW_RESET_EXPECTED, &adapter->state_flags) &&
+		!test_bit(ESP_FW_RECOVERY_EXHAUSTED, &adapter->state_flags);
+	if (!preserve_active_reset || !active_reset) {
+		adapter->fw_boot_reset_attempts = 0;
+		adapter->fw_boot_deadline = 0;
+		adapter->fw_recovery_backoff_ms = ESP_FW_RECOVERY_QUIET_MS;
+		clear_bit(ESP_FW_RECOVERY_EXHAUSTED, &adapter->state_flags);
+		clear_bit(ESP_FW_RECOVERY_PENDING, &adapter->state_flags);
+		clear_bit(ESP_FW_RESET_EXPECTED, &adapter->state_flags);
+		clear_bit(ESP_FW_RESTART_NEEDED, &adapter->state_flags);
+		clear_bit(ESP_ALLOW_RECONSTRUCT, &adapter->state_flags);
+		clear_bit(ESP_CLEANUP_IN_PROGRESS, &adapter->state_flags);
+	}
+	spin_unlock_irqrestore(&adapter->fw_recovery_lock, flags);
+}
+
 void esp_request_firmware_restart(struct esp_adapter *adapter)
 {
 	unsigned long flags;
@@ -659,6 +691,8 @@ static void esp_radio_service_work(struct work_struct *work)
 	struct esp_adapter *adapter =
 		container_of(work, struct esp_adapter, radio_service_work);
 	u8 desired;
+	u8 effective;
+	u8 supported;
 	u8 active;
 	u8 latest;
 	int ret;
@@ -685,27 +719,31 @@ again:
 		return;
 	}
 
-	if ((desired & ESP_RADIO_SERVICE_BT) &&
-	    !esp_bt_service_supported(adapter)) {
-		/* Requested BT is unavailable in this image. This is a terminal
-		 * *service* rejection, not a failure of the already-published WLAN
-		 * incarnation. In particular, do not leave an armed reset deadline
-		 * and pending radio-init bit that would coalesce future resets. */
-		esp_err("Bluetooth requested but firmware has no HCI; leaving WLAN operational\n");
-		published = true;
-		goto check_latest;
-	}
-	if ((desired & ESP_RADIO_SERVICE_IEEE802154) &&
-	    !(adapter->ext_capabilities & ESP_EXT_CAP_RCP_AVAILABLE)) {
-		esp_err("802.15.4 requested but firmware has no RCP; leaving WLAN operational\n");
-		published = true;
-		goto check_latest;
-	}
+	/* Optional secondary radios are independent. Apply every requested
+	 * service that this firmware actually advertises instead of rejecting
+	 * the whole mask when only one member is unavailable. */
+	supported = ESP_RADIO_SERVICE_NONE;
+	if (esp_bt_service_supported(adapter))
+		supported |= ESP_RADIO_SERVICE_BT;
+	if (adapter->ext_capabilities & ESP_EXT_CAP_RCP_AVAILABLE)
+		supported |= ESP_RADIO_SERVICE_IEEE802154;
+	effective = desired & supported;
 
-	ret = cmd_set_radio_service(adapter, desired);
+	if ((desired & ESP_RADIO_SERVICE_BT) &&
+	    !(effective & ESP_RADIO_SERVICE_BT))
+		esp_err("Bluetooth requested but firmware has no HCI; continuing without BT\n");
+	if ((desired & ESP_RADIO_SERVICE_IEEE802154) &&
+	    !(effective & ESP_RADIO_SERVICE_IEEE802154))
+		esp_err("802.15.4 requested but firmware has no RCP; continuing without 802.15.4\n");
+	if (effective != desired)
+		esp_info("Radio request %s reduced to supported subset %s\n",
+			 esp_radio_service_name(desired),
+			 esp_radio_service_name(effective));
+
+	ret = cmd_set_radio_service(adapter, effective);
 	if (ret) {
 		esp_err("Failed to select radio services %s: %d\n",
-			esp_radio_service_name(desired), ret);
+			esp_radio_service_name(effective), ret);
 		/* Initial radio publication belongs to this boot's recovery.
 		 * Bound retries for service command failure rather than silently
 		 * terminating a still-pending boot publication. */
@@ -721,7 +759,7 @@ again:
 	    ESP_RADIO_SERVICE_F_RESTART_REQUIRED) {
 		esp_info("Radio service change %s -> %s requires firmware reincarnation\n",
 			esp_radio_service_name(adapter->radio_service_active),
-			esp_radio_service_name(desired));
+			esp_radio_service_name(effective));
 
 		/*
 		 * A requested removal crossed a backend lifetime boundary. Publish
@@ -1128,7 +1166,9 @@ static int process_event_esp_bootup(struct esp_adapter *adapter, u8 *evt_buf, u8
 				ret = -EPROTO;
 				goto fail;
 			}
-			if (tag_len != 1) {
+			if (tag_len != 1 || !*(pos + 2)) {
+				esp_err("Invalid SPI clock TLV value/length value=%u len=%d\n",
+					tag_len ? *(pos + 2) : 0, tag_len);
 				ret = -EINVAL;
 				goto fail;
 			}
@@ -1191,6 +1231,16 @@ static int process_event_esp_bootup(struct esp_adapter *adapter, u8 *evt_buf, u8
 		esp_err("Firmware boot event did not provide a supported chipset ID\n");
 		ret = -EPROTO;
 		goto fail;
+	}
+
+	/* Older compatible SPI firmware may omit the optional clock TLV. Recovery
+	 * deliberately receives BOOT at 1 MHz; only after transport/chip validation
+	 * restore the historical configured startup rate (or 10 MHz default) so an
+	 * omitted TLV cannot pin the accepted session at the bootstrap rate. */
+	if (adapter->if_type == ESP_IF_TYPE_SPI && !seen_spi_clk) {
+		ret = esp_adjust_spi_clock(adapter, 0);
+		if (ret)
+			goto fail;
 	}
 
 	if (seen_rcp_nonce && !(adapter->ext_capabilities & ESP_EXT_CAP_RCP)) {

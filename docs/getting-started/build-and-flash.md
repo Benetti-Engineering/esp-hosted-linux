@@ -114,7 +114,7 @@ Use `target=spi` for SPI or `target=usb` for USB. [Porting](../porting.md) cover
 
 ESP-Hosted kernel drivers do not take a `resetpin=` module argument. Reset and control GPIOs are owned by Device Tree or handled in-band:
 
-- **SDIO:** Post-enumeration reset and recovery are handled in-band over the SDIO bus. Insert the module directly:
+- **SDIO:** The generation-ACKed in-band reboot path is always available. Boards whose MMC pwrseq actually toggles ESP EN may opt into full-chip hardware reset with the `espressif,full-chip-reset` controller marker. Insert the module directly:
 
 ```sh
 sudo modprobe bluetooth

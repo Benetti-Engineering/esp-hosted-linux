@@ -14,6 +14,7 @@
 #include <linux/mmc/host.h>
 #include <linux/module.h>
 #include <linux/err.h>
+#include <linux/property.h>
 #include <linux/slab.h>
 #include <linux/workqueue.h>
 #include "esp_if.h"
@@ -42,6 +43,11 @@
 #define ESP_SDIO_PKT_LEN_DELAYED_RETRIES 32
 #define ESP_SDIO_PROBE_IO_RETRIES         3
 #define ESP_SDIO_MAX_CLK_MHZ             50U
+#define ESP_SDIO_REBOOT_SETTLE_MS          250U
+#define ESP_SDIO_REBOOT_READY_RETRY_MS      50U
+#define ESP_SDIO_REBOOT_ENABLE_ATTEMPT_MS  500U
+#define ESP_SDIO_REBOOT_READY_TIMEOUT_MS   3000U
+#define ESP_SDIO_FULL_CHIP_RESET_PROP "espressif,full-chip-reset"
 
 #define CHECK_SDIO_RW_ERROR(ret) do {                                     \
 	if (ret)                                                            \
@@ -92,6 +98,10 @@ static atomic_t sdio_soft_reset_attempts = ATOMIC_INIT(0);
  * Serialize both paths so a stale counter cannot reject that new reboot. */
 static DEFINE_SPINLOCK(sdio_reset_budget_lock);
 static u32 sdio_soft_reset_budget_epoch;
+/* Common fw_boot_deadline value for which a physical MMC/EN reset has already
+ * been attempted. A recovery retry inside that same counted attempt may retry
+ * re-enable/OPEN, but must not power-cycle the firmware a second time. */
+static unsigned long sdio_hard_reset_deadline;
 static atomic_t sdio_hard_reset_unavailable = ATOMIC_INIT(0);
 
 static void esp_sdio_reset_budget_sync_locked(struct esp_adapter *adapter)
@@ -1055,7 +1065,8 @@ static int esp_sdio_handshake_slave_reset(struct esp_sdio_context *context, u8 i
 	return ret;
 }
 
-static int esp_sdio_reenable_func(struct esp_sdio_context *context)
+static int esp_sdio_reenable_func_timeout(struct esp_sdio_context *context,
+		unsigned int enable_timeout_ms)
 {
 	struct sdio_func *func;
 	unsigned int old_timeout;
@@ -1072,7 +1083,9 @@ static int esp_sdio_reenable_func(struct esp_sdio_context *context)
 		return -ESHUTDOWN;
 	}
 	old_timeout = func->enable_timeout;
-	if (old_timeout < 5000)
+	if (enable_timeout_ms)
+		func->enable_timeout = enable_timeout_ms;
+	else if (old_timeout < 5000)
 		func->enable_timeout = 5000;
 	ret = sdio_enable_func(func);
 	if (!ret)
@@ -1099,6 +1112,55 @@ static int esp_sdio_reenable_func(struct esp_sdio_context *context)
 	if (ret)
 		esp_err("SDIO recover: re-claim IRQ failed %d\n", ret);
 	return ret;
+}
+
+static int esp_sdio_reenable_func(struct esp_sdio_context *context)
+{
+	return esp_sdio_reenable_func_timeout(context, 0);
+}
+
+/* RESET_DONE is published before firmware waits 150 ms and calls esp_restart().
+ * Do not fire OPEN at a fixed offset into that reboot. Wait until the new SDIO
+ * function is actually alive and its IRQ has been re-armed; OPEN can then be
+ * safely latched even while app_main() is still in its one-second startup
+ * delay before waiting on init_sem. */
+static int esp_sdio_wait_reenable_after_reboot(struct esp_sdio_context *context)
+{
+	unsigned long deadline =
+		jiffies + msecs_to_jiffies(ESP_SDIO_REBOOT_READY_TIMEOUT_MS);
+	unsigned int remaining_ms;
+	unsigned int attempt_ms;
+	unsigned int sleep_ms;
+	int ret = -ETIMEDOUT;
+
+	msleep(ESP_SDIO_REBOOT_SETTLE_MS);
+	while (time_before(jiffies, deadline)) {
+		remaining_ms = jiffies_to_msecs(deadline - jiffies);
+		if (!remaining_ms)
+			remaining_ms = 1;
+		attempt_ms = remaining_ms;
+		if (attempt_ms > ESP_SDIO_REBOOT_ENABLE_ATTEMPT_MS)
+			attempt_ms = ESP_SDIO_REBOOT_ENABLE_ATTEMPT_MS;
+
+		ret = esp_sdio_reenable_func_timeout(context, attempt_ms);
+		if (!ret)
+			return 0;
+		if (ret == -ESHUTDOWN || ret == -ENODEV)
+			return ret;
+		if (time_after_eq(jiffies, deadline))
+			break;
+
+		remaining_ms = jiffies_to_msecs(deadline - jiffies);
+		sleep_ms = remaining_ms;
+		if (sleep_ms > ESP_SDIO_REBOOT_READY_RETRY_MS)
+			sleep_ms = ESP_SDIO_REBOOT_READY_RETRY_MS;
+		if (sleep_ms)
+			msleep(sleep_ms);
+	}
+
+	esp_err("SDIO recover: restarted function did not become ready within %u ms: %d\n",
+		ESP_SDIO_REBOOT_READY_TIMEOUT_MS, ret);
+	return ret ? ret : -ETIMEDOUT;
 }
 
 static int esp_sdio_rebase_incarnation(struct esp_sdio_context *context)
@@ -1145,9 +1207,26 @@ static int esp_sdio_mmc_hw_reset(struct sdio_func *func)
 #endif
 }
 
-/* Request a real EN reset only when Device Tree has a bound MMC pwrseq.
- * The recovery worker serializes the operation with all SDIO traffic.
- * Absence must fall through to an acknowledged in-band reboot. */
+/* A generic MMC pwrseq is not sufficient evidence that mmc_hw_reset() resets
+ * the ESP CPU. mmc-pwrseq-simple may legally have no reset-gpios at all, or it
+ * may sequence some unrelated board rail. Require the board DT to opt into the
+ * full-incarnation contract explicitly on the MMC host node. */
+static bool esp_sdio_has_full_chip_reset(struct esp_sdio_context *context)
+{
+	struct mmc_host *host;
+
+	if (!context || !context->func || !context->func->card)
+		return false;
+
+	host = context->func->card->host;
+	return host && host->pwrseq && host->parent &&
+		device_property_read_bool(host->parent,
+					  ESP_SDIO_FULL_CHIP_RESET_PROP);
+}
+
+/* Request a real EN reset only when Device Tree explicitly declares that the
+ * bound MMC pwrseq resets the complete ESP incarnation. Otherwise fall back to
+ * the generation-ACKed in-band firmware reboot. */
 static int esp_sdio_reset_target(struct esp_adapter *adapter)
 {
 	struct esp_sdio_context *context;
@@ -1166,7 +1245,7 @@ static int esp_sdio_reset_target(struct esp_adapter *adapter)
 	spin_lock_irqsave(&sdio_reset_budget_lock, flags);
 	esp_sdio_reset_budget_sync_locked(adapter);
 	if (!atomic_read(&sdio_hard_reset_unavailable) &&
-	    context->func->card->host->pwrseq) {
+	    esp_sdio_has_full_chip_reset(context)) {
 		atomic_set(&sdio_reset_request_epoch,
 			   atomic_read(&adapter->fw_boot_commit_epoch));
 		atomic_set(&sdio_hard_reset_requested, 1);
@@ -1190,6 +1269,11 @@ static int esp_sdio_hard_reset_and_reopen(struct esp_adapter *adapter,
 		struct esp_sdio_context *context, const char *reason)
 {
 	struct sdio_func *func;
+	unsigned long flags;
+	unsigned long attempt_deadline;
+	bool active_attempt;
+	bool full_chip_reset;
+	bool issue_hard_reset = false;
 	int ret;
 
 	if (!adapter || !context || !context->func || !context->func->card)
@@ -1197,6 +1281,39 @@ static int esp_sdio_hard_reset_and_reopen(struct esp_adapter *adapter,
 	if (test_bit(ESP_DRIVER_UNLOADING, &adapter->state_flags) ||
 	    test_bit(ESP_TRANSPORT_REMOVING, &adapter->state_flags))
 		return -ESHUTDOWN;
+
+	/*
+	 * Every operation that can create a new firmware incarnation must belong
+	 * to the common bounded reboot policy. Transport-only recovery reaches
+	 * this helper without a boot deadline; promote it to a counted firmware
+	 * restart and let the next recovery pass claim the transport reset.
+	 *
+	 * A counted attempt may retry function re-enable/OPEN several times. Claim
+	 * the physical reset exactly once for that attempt by keying it to the
+	 * common boot deadline. This bounds actual EN power-cycles as tightly as
+	 * the common reboot budget instead of power-cycling on every retry.
+	 */
+	full_chip_reset = !atomic_read(&sdio_hard_reset_unavailable) &&
+		esp_sdio_has_full_chip_reset(context);
+	spin_lock_irqsave(&adapter->fw_recovery_lock, flags);
+	attempt_deadline = adapter->fw_boot_deadline;
+	active_attempt = !!attempt_deadline;
+	if (active_attempt && full_chip_reset) {
+		spin_lock(&sdio_reset_budget_lock);
+		if (sdio_hard_reset_deadline != attempt_deadline) {
+			sdio_hard_reset_deadline = attempt_deadline;
+			issue_hard_reset = true;
+		}
+		spin_unlock(&sdio_reset_budget_lock);
+	}
+	spin_unlock_irqrestore(&adapter->fw_recovery_lock, flags);
+	if (!active_attempt) {
+		esp_info("SDIO recover: escalating %s to counted firmware reboot attempt\n",
+			 reason ? reason : "transport failure");
+		esp_schedule_fw_reset_recovery(adapter);
+		esp_request_firmware_restart(adapter);
+		return -EAGAIN;
+	}
 
 	func = context->func;
 
@@ -1209,19 +1326,35 @@ static int esp_sdio_hard_reset_and_reopen(struct esp_adapter *adapter,
 	 * that power cycle, giving us an out-of-band ESP EN reset.
 	 */
 	set_bit(ESP_FW_RESET_EXPECTED, &adapter->state_flags);
-	clear_bit(ESP_FW_RESTART_NEEDED, &adapter->state_flags);
+	/* Keep RESTART_NEEDED asserted until the transport has actually accepted
+	 * the reset. It is cleared below only after mmc_hw_reset() succeeds or an
+	 * asynchronous MMC reset has been scheduled. */
 	atomic_set(&sdio_need_counter_rebase, 1);
 	atomic_set(&sdio_need_slave_reset, 0);
 	sdio_purge_tx_queues(context);
 	skb_queue_purge(&context->rx_q);
 	sdio_buf_available = 0;
 
-	esp_info("SDIO recover: MMC hard reset (%s)\n",
-		 reason ? reason : "transport failure");
-
-	sdio_claim_host(func);
-	ret = esp_sdio_mmc_hw_reset(func);
-	sdio_release_host(func);
+	if (!full_chip_reset) {
+		/* An arbitrary MMC pwrseq is not proof that the ESP CPU resets, and
+		 * a structurally unsupported provider stays disabled for this binding.
+		 * Route the attempt through the generation-ACKed CLOSE fallback. */
+		ret = -EOPNOTSUPP;
+		esp_info("SDIO recover: full-chip MMC reset unavailable (%s); using acknowledged firmware restart\n",
+			 reason ? reason : "transport failure");
+	} else if (!issue_hard_reset) {
+		/* This counted reboot attempt already toggled EN. A failure after that
+		 * point belongs to the same new incarnation; retry host-side re-enable
+		 * and OPEN without destroying that incarnation again. */
+		ret = 0;
+		esp_info("SDIO recover: full-chip reset already issued in this reboot attempt; retrying re-enable/OPEN\n");
+	} else {
+		esp_info("SDIO recover: MMC full-chip reset (%s)\n",
+			 reason ? reason : "transport failure");
+		sdio_claim_host(func);
+		ret = esp_sdio_mmc_hw_reset(func);
+		sdio_release_host(func);
+	}
 
 	/*
 	 * SDIO cards with more than one probed function may schedule an
@@ -1229,23 +1362,46 @@ static int esp_sdio_hard_reset_and_reopen(struct esp_adapter *adapter,
 	 * one function, but do not touch the old function object in that case.
 	 */
 	if (ret > 0) {
+		clear_bit(ESP_FW_RESTART_NEEDED, &adapter->state_flags);
 		esp_info("SDIO recover: MMC hard reset scheduled asynchronously\n");
 		return -EAGAIN;
 	}
 	if (ret < 0) {
-		atomic_set(&sdio_hard_reset_unavailable, 1);
-		esp_err("SDIO recover: MMC hard reset failed %d; falling back to firmware restart\n", ret);
-		/*
-		 * Some MMC hosts have no usable hardware-reset/pwrseq operation.
-		 * Preserve the existing in-band firmware restart path rather than
-		 * making optional DT support mandatory for recovery on those boards.
-		 * This also re-publishes the restart request after the failed
-		 * hard-reset attempt consumed ESP_FW_RESTART_NEEDED.
-		 */
-		esp_schedule_fw_reset_recovery(adapter);
+		/* Keep restart intent asserted until the generation-matched CLOSE ACK
+		 * succeeds. The hard-reset request already consumed its transport bit;
+		 * clearing this flag here would make a failed first CLOSE attempt fall
+		 * through to OPEN-only recovery until the global deadline expires. */
+		set_bit(ESP_FW_RESTART_NEEDED, &adapter->state_flags);
+
+		/* Only cache a structural lack of hardware-reset support. Controller
+		 * I/O/timeouts are transient: the next recovery episode should be able
+		 * to try the DT EN reset again instead of permanently degrading to
+		 * software reboot for the lifetime of this binding. */
+		if (ret == -EOPNOTSUPP || ret == -ENOSYS)
+			atomic_set(&sdio_hard_reset_unavailable, 1);
+		esp_err("SDIO recover: MMC hard reset failed %d; falling back to acknowledged firmware restart\n",
+			ret);
+
+		/* Keep a same-attempt fallback when the counted reboot is still
+		 * active. The deadline may only have disappeared if a concurrent boot
+		 * completed or the common policy moved on while this reset failed. */
+		spin_lock_irqsave(&adapter->fw_recovery_lock, flags);
+		active_attempt = !!adapter->fw_boot_deadline;
+		spin_unlock_irqrestore(&adapter->fw_recovery_lock, flags);
+		if (active_attempt) {
+			if (!esp_sdio_soft_reset_budget_arm(adapter)) {
+				esp_err("SDIO recover: software reboot fallback budget exhausted\n");
+				return -EHOSTUNREACH;
+			}
+			esp_info("SDIO recover: queued ACKed CLOSE fallback in current reboot attempt\n");
+			return -EAGAIN;
+		}
+
 		esp_request_firmware_restart(adapter);
 		return ret;
 	}
+
+	clear_bit(ESP_FW_RESTART_NEEDED, &adapter->state_flags);
 
 	/*
 	 * MMC hardware reset restarts the slave's cumulative PACKET_LEN and
@@ -1372,7 +1528,12 @@ static int esp_sdio_recover_transport_inner(struct esp_adapter *adapter)
 		atomic_set(&context->rx_pending, 0);
 		context->rx_len_retry_count = 0;
 		atomic_set(&sdio_need_counter_rebase, 1);
-		msleep(180);
+		ret = esp_sdio_wait_reenable_after_reboot(context);
+		if (ret) {
+			esp_err("SDIO recover: new firmware function not ready after ACKed reboot: %d\n",
+				ret);
+			return ret;
+		}
 		return esp_sdio_open_and_poll(adapter, context);
 	}
 
@@ -2801,6 +2962,10 @@ static int esp_probe(struct sdio_func *func,
 	}
 
 	context->adapter->dev = &func->dev;
+	/* Preserve the counted attempt only for an asynchronous MMC reset that is
+	 * genuinely still awaiting its new boot. Ordinary unbind/rebind, including
+	 * a previously exhausted session, gets a fresh common recovery budget. */
+	esp_reset_boot_recovery_for_binding(context->adapter, true);
 	clear_bit(ESP_TRANSPORT_REMOVING, &context->adapter->state_flags);
 	atomic_set(&context->adapter->state, ESP_CONTEXT_RX_READY);
 

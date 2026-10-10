@@ -38,6 +38,12 @@
 
 		__overlay__ {
 			mmc-pwrseq = <&esp_sdio_pwrseq>;
+			/*
+			 * Driver contract: this pwrseq toggles ESP EN/reset and therefore
+			 * creates a new firmware incarnation when mmc_hw_reset() power-cycles
+			 * the card. A generic/unmarked MMC pwrseq is never assumed to do so.
+			 */
+			espressif,full-chip-reset;
 		};
 	};
 
