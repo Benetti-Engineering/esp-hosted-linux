@@ -705,9 +705,18 @@ static int send_command_resp(uint8_t if_type,
                  active_cmd_code, active_cmd_seq, cmd_code);
     }
 
-    buf_handle.payload_len = sizeof(struct command_header) +
-                             sizeof(struct esp_payload_header) +
-                             len;
+    /* Bootstrap CMD35 is authenticated as one canonical zero-payload
+     * command_header by Linux before accepting the firmware reboot ACK.
+     * The generic response allocator historically reserves an additional
+     * transport-header-sized payload even though esp_spi_write() adds the
+     * real outer wire header itself. Do not transmit that spare header as
+     * part of the privileged CMD35 response. Keep legacy response layout
+     * unchanged for every other command. */
+    if (if_type == ESP_INTERNAL_IF && cmd_code == CMD_HOST_REBOOT)
+        buf_handle.payload_len = sizeof(struct command_header) + len;
+    else
+        buf_handle.payload_len = sizeof(struct command_header) +
+                                 sizeof(struct esp_payload_header) + len;
     buf_handle.payload = heap_caps_malloc(buf_handle.payload_len, MALLOC_CAP_DMA);
     if (!buf_handle.payload) {
         ESP_LOGE(TAG, "Malloc send buffer fail!");
@@ -3913,6 +3922,25 @@ send_resp:
 
 typedef int (*cmd_handler_fn)(uint8_t if_type, uint8_t *payload, uint16_t payload_len);
 
+/* A pre-boot SPI host may not have an initialized Wi-Fi command interface.
+ * It uses the internal Hosted channel to request a complete firmware reboot.
+ * Only SPI has post-transaction ordering that can prove the ACK crossed the
+ * wire before esp_restart(). SDIO/USB have their own acknowledged reset
+ * protocols and must never advertise success for CMD35 without that semantic. */
+static int process_host_reboot(uint8_t if_type, uint8_t *payload, uint16_t len)
+{
+    if (if_type != ESP_INTERNAL_IF || len < sizeof(struct command_header))
+        return ESP_ERR_INVALID_ARG;
+
+#if CONFIG_ESP_SPI_HOST_INTERFACE
+    return send_command_resp(if_type, CMD_HOST_REBOOT,
+                             CMD_RESPONSE_SUCCESS, NULL, 0);
+#else
+    return send_command_resp(if_type, CMD_HOST_REBOOT,
+                             CMD_RESPONSE_UNSUPPORTED, NULL, 0);
+#endif
+}
+
 struct esp_cmd_entry {
     uint8_t        cmd_code;
     uint16_t       min_payload_len;
@@ -3955,6 +3983,7 @@ static const struct esp_cmd_entry s_cmd_table[] = {
     { CMD_STA_SET_AUTHORIZED,  sizeof(struct cmd_sta_set_authorized), process_sta_set_authorized, "STA_SET_AUTH" },
     { CMD_SET_RADIO_SERVICE,  sizeof(struct cmd_radio_service),       process_radio_service,      "SET_RADIO_SERVICE" },
     { CMD_GET_RADIO_SERVICE,  sizeof(struct command_header),          process_radio_service,      "GET_RADIO_SERVICE" },
+    { CMD_HOST_REBOOT,        sizeof(struct command_header),          process_host_reboot,         "HOST_REBOOT" },
 };
 
 int esp_cmd_dispatch(uint8_t if_type, uint8_t *payload, uint16_t payload_len)

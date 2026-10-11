@@ -75,6 +75,183 @@ remove_runtime_overlay()
     fi
 }
 
+esp_sdio_device_present()
+{
+    local dev=""
+    local vendor=""
+    local device=""
+
+    for dev in /sys/bus/sdio/devices/*:*:*; do
+        [ -e "$dev" ] || continue
+        vendor="$(cat "$dev/vendor" 2>/dev/null || true)"
+        device="$(cat "$dev/device" 2>/dev/null || true)"
+        case "$vendor:$device" in
+            0x6666:0x2222|0x0092:0x6666)
+                return 0
+                ;;
+        esac
+    done
+    return 1
+}
+
+sdio_boot_full_chip_reset_declared()
+{
+    local tree=""
+
+    # /proc/device-tree is commonly a symlink. Resolve it so find actually
+    # descends the live tree instead of testing only the symlink itself.
+    tree="$(readlink -f /proc/device-tree 2>/dev/null || true)"
+    if [ -z "$tree" ] || [ ! -d "$tree" ]; then
+        tree="/sys/firmware/devicetree/base"
+    fi
+    [ -d "$tree" ] || return 1
+    find "$tree" -type f -name 'espressif,full-chip-reset' -print -quit 2>/dev/null |
+        grep -q .
+}
+
+dt_gpio_cell_lows()
+{
+    local prop="$1"
+
+    [ -r "$prop" ] || return 1
+    # Raspberry Pi GPIO numbers fit in the low byte of each big-endian DT
+    # cell. Emit that byte for every cell without requiring fdtget/hexdump.
+    od -An -v -tu1 "$prop" 2>/dev/null |
+        awk '{ for (i = 1; i <= NF; i++) { n++; if (n % 4 == 0) printf "%s%s", sep, $i; sep = " " } }
+             END { if (n) print "" }'
+}
+
+rpi_sdio_boot_overlay_active()
+{
+    local tree=""
+
+    tree="$(readlink -f /proc/device-tree 2>/dev/null || true)"
+    if [ -z "$tree" ] || [ ! -d "$tree" ]; then
+        tree="/sys/firmware/devicetree/base"
+    fi
+    [ -d "$tree" ] || return 1
+    find "$tree" -type d -name 'sdio_ovl_pins' -print -quit 2>/dev/null |
+        grep -q .
+}
+
+rpi_sdio_active_pins()
+{
+    local tree=""
+    local node=""
+    local pins=""
+    local nodes=""
+
+    tree="$(readlink -f /proc/device-tree 2>/dev/null || true)"
+    if [ -z "$tree" ] || [ ! -d "$tree" ]; then
+        tree="/sys/firmware/devicetree/base"
+    fi
+    [ -d "$tree" ] || return 1
+
+    nodes="$(find "$tree" -type d -name 'sdio_ovl_pins' -print 2>/dev/null || true)"
+    [ -n "$nodes" ] || return 1
+    for node in $nodes; do
+        local node_pins=""
+
+        [ -r "$node/brcm,pins" ] || continue
+        node_pins="$(dt_gpio_cell_lows "$node/brcm,pins" || true)"
+        [ -n "$node_pins" ] || continue
+        pins="${pins:+$pins }$node_pins"
+    done
+    [ -n "$pins" ] || return 1
+    echo "$pins"
+}
+
+rpi_sdio_pwrseq_reset_pins()
+{
+    local tree=""
+    local node=""
+    local cells=""
+    local nodes=""
+
+    tree="$(readlink -f /proc/device-tree 2>/dev/null || true)"
+    if [ -z "$tree" ] || [ ! -d "$tree" ]; then
+        tree="/sys/firmware/devicetree/base"
+    fi
+    [ -d "$tree" ] || return 1
+
+    nodes="$(find "$tree" -type d -name 'esp-sdio-pwrseq' -print 2>/dev/null || true)"
+    [ -n "$nodes" ] || return 1
+    for node in $nodes; do
+        [ -r "$node/reset-gpios" ] || continue
+        cells="$(dt_gpio_cell_lows "$node/reset-gpios" || true)"
+        set -- $cells
+        [ "$#" -ge 2 ] && echo "$2"
+    done
+}
+
+rpi_sdio_conflicts_with_spi()
+{
+    local sdio_pins=""
+    local reset_pins=""
+    local pin=""
+    local spi_pin=""
+
+    sdio_pins="$(rpi_sdio_active_pins || true)"
+    reset_pins="$(rpi_sdio_pwrseq_reset_pins || true)"
+    [ -n "$sdio_pins$reset_pins" ] || return 1
+
+    # SPI0 owns GPIO7..11. The ESP overlay additionally owns the selected
+    # reset/handshake/data-ready pins. Refuse only on a real overlap; alternate
+    # Raspberry Pi SDIO groups such as GPIO34..39 can coexist with SPI when
+    # their pwrseq reset GPIO and the selected ESP control GPIOs are distinct.
+    for pin in $sdio_pins $reset_pins; do
+        for spi_pin in 7 8 9 10 11 \
+            "$SPI_RESETGPIO" "$SPI_HANDSHAKEGPIO" "$SPI_DATAREADYGPIO"; do
+            [ "$pin" = "$spi_pin" ] && return 0
+        done
+    done
+    return 1
+}
+
+sdio_esp_bound()
+{
+    local dev=""
+
+    for dev in /sys/bus/sdio/drivers/esp32_sdio/*:*:*; do
+        [ -e "$dev" ] && return 0
+    done
+    return 1
+}
+
+wait_for_sdio_bind()
+{
+    local retries=20
+
+    while [ "$retries" -gt 0 ]; do
+        sdio_esp_bound && return 0
+        sleep 0.25
+        retries=$((retries - 1))
+    done
+    return 1
+}
+
+sdio_full_chip_reset_declared()
+{
+    local dev=""
+    local path=""
+
+    # Verify the marker only on the ancestry of an SDIO function actually bound
+    # to esp32_sdio. A global /proc/device-tree search can report a different
+    # MMC controller and falsely claim that ESP reset ownership is active.
+    for dev in /sys/bus/sdio/drivers/esp32_sdio/*:*:*; do
+        [ -e "$dev" ] || continue
+        path="$(readlink -f "$dev" 2>/dev/null || true)"
+        while [ -n "$path" ] && [ "$path" != "/" ]; do
+            if [ -e "$path/of_node/espressif,full-chip-reset" ]; then
+                return 0
+            fi
+            path="${path%/*}"
+            [ -n "$path" ] || path="/"
+        done
+    done
+    return 1
+}
+
 require_gpio()
 {
     local name="$1"
@@ -158,6 +335,15 @@ build_driver()
         command -v dtc >/dev/null 2>&1 || die "dtc is required for SPI Device Tree setup"
         command -v dtoverlay >/dev/null 2>&1 || die "dtoverlay is required for SPI Device Tree setup"
         make spi-dtbo
+    elif [ "$IF_TYPE" = "sdio" ]; then
+        # SDIO remains fully usable with its acknowledged in-band reboot path.
+        # Building the optional boot-time EN-reset overlay must not turn dtc
+        # into a new prerequisite for ordinary SDIO bring-up.
+        if command -v dtc >/dev/null 2>&1; then
+            make sdio-dtbo
+        else
+            echo "NOTE: dtc not found; skipping optional esp32-sdio-pwrseq.dtbo build" >&2
+        fi
     fi
 }
 
@@ -205,8 +391,9 @@ setup_spi()
         *) die "spi_cs_change must be 0 or 1" ;;
     esac
 
-    # Remove only overlays owned by this helper. Do not touch the Raspberry Pi
-    # SDIO boot overlay: custom SPI control GPIOs can coexist with it.
+    # Only runtime SPI overlays are safe to replace here. A boot-time SDIO
+    # configuration owns the MMC pinmux (and, with our pwrseq overlay, ESP EN)
+    # before this script runs; it cannot be safely repurposed into SPI at runtime.
     remove_runtime_overlay esp32-spi
     remove_runtime_overlay spidev_disabler
 
@@ -250,6 +437,20 @@ setup_sdio()
     fi
 
     run_root insmod ./esp32_sdio.ko "${module_args[@]}"
+
+    if ! wait_for_sdio_bind; then
+        echo "NOTE: ESP SDIO function did not bind within 5 seconds; reset DT contract cannot be verified" >&2
+    elif sdio_full_chip_reset_declared; then
+        echo "SDIO full-chip reset marker is active on the bound ESP MMC host"
+    else
+        echo "WARNING: bound ESP SDIO host has no active full-chip-reset DT contract." >&2
+        echo "         Recovery will use the generation-ACKed software reboot fallback." >&2
+        echo "         For DT EN reset, install overlays/esp32-sdio-pwrseq.dtbo in the" >&2
+        echo "         Raspberry Pi boot overlays directory, add these before reboot:" >&2
+        echo "           dtoverlay=esp32-sdio-pwrseq" >&2
+        echo "           dtoverlay=sdio,poll_once=off" >&2
+        echo "         Then reboot before running this helper again." >&2
+    fi
 }
 
 setup_usb()
@@ -269,6 +470,30 @@ setup_usb()
 
 wlan_init()
 {
+    if [ "$IF_TYPE" = "spi" ]; then
+        # Refuse before unloading anything when the live SDIO boot pinmux or
+        # pwrseq reset GPIO actually overlaps SPI0/control GPIOs. Alternate
+        # Raspberry Pi SDIO pin groups may coexist when they are disjoint.
+        if rpi_sdio_conflicts_with_spi; then
+            die "Raspberry Pi SDIO boot GPIOs overlap the selected SPI configuration; change one side or disable the SDIO boot overlays and reboot"
+        fi
+        # Presence without a parseable GPIO map is not evidence of safety.
+        if rpi_sdio_boot_overlay_active &&
+           ! rpi_sdio_active_pins >/dev/null; then
+            die "Raspberry Pi SDIO pinmux is active but its GPIO map cannot be verified; disable the SDIO boot configuration and reboot before selecting SPI"
+        fi
+        if sdio_boot_full_chip_reset_declared &&
+           ! rpi_sdio_pwrseq_reset_pins >/dev/null; then
+            die "ESP SDIO full-chip reset is active but its reset GPIO cannot be verified; disable the SDIO boot configuration and reboot before selecting SPI"
+        fi
+        # If an ESP SDIO session/contract is active but the helper cannot see
+        # the stock Pi pin node, its data-pin ownership is unknown: fail closed.
+        if { esp_sdio_device_present || sdio_boot_full_chip_reset_declared; } &&
+           ! rpi_sdio_boot_overlay_active; then
+            die "ESP SDIO is active but its boot pinmux cannot be verified; disable the SDIO boot configuration and reboot before selecting SPI"
+        fi
+    fi
+
     build_driver
     unload_esp_modules
 

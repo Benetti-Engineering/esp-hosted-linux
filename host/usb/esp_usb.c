@@ -1005,6 +1005,11 @@ static int esp_usb_probe(struct usb_interface *intf,
 	adapter->if_ops = &esp_usb_if_ops;
 	adapter->if_type = ESP_IF_TYPE_USB;
 	adapter->dev = &intf->dev;
+	/* A USB firmware restart may disconnect/re-enumerate while a counted
+	 * recovery attempt is still active. Preserve that attempt, but treat an
+	 * ordinary reconnect (including one after terminal exhaustion) as a fresh
+	 * binding with a fresh common recovery budget. */
+	esp_reset_boot_recovery_for_binding(adapter, true);
 	clear_bit(ESP_TRANSPORT_REMOVING, &adapter->state_flags);
 	clear_bit(ESP_CLEANUP_IN_PROGRESS, &adapter->state_flags);
 	atomic_set(&adapter->state, ESP_CONTEXT_RX_READY);

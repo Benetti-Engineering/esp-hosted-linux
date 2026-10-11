@@ -22,6 +22,9 @@
 #include "esp_cmd.h"
 
 #define SPI_INITIAL_CLK_MHZ     10
+/* The first boot/ready event precedes firmware clock negotiation. */
+#define SPI_BOOTSTRAP_CLK_MHZ      1
+#define SPI_REBOOT_ACK_TIMEOUT_MS 2000
 #define SPI_MAX_CLK_MHZ         40U
 #define TX_MAX_PENDING_COUNT    100
 #define TX_RESUME_THRESHOLD     (TX_MAX_PENDING_COUNT/5)
@@ -41,6 +44,7 @@ static bool spi_accepting_work(void);
 static void esp_spi_pause_for_transport_recovery(struct esp_adapter *adapter);
 static bool spi_get_cmd_info(struct sk_buff *skb, u8 *cmd_code, u16 *cmd_seq);
 static int esp_spi_reset_target(struct esp_adapter *adapter);
+static int process_rx_buf(struct sk_buff *skb, bool rx_pending);
 
 static volatile u8 data_path;
 volatile u8 host_sleep;
@@ -48,6 +52,26 @@ static struct esp_spi_context spi_context;
 static atomic_t tx_pending;
 static DEFINE_MUTEX(spi_reset_lock);
 static bool spi_driver_registered;
+static atomic_t spi_soft_reboot_attempts = ATOMIC_INIT(0);
+/* Reboot attempts are scoped to the committed firmware incarnation. */
+static DEFINE_SPINLOCK(spi_reboot_budget_lock);
+static u32 spi_reboot_budget_epoch;
+/* Boot-frame rescue is an initial-probe exception only. Once a firmware
+ * incarnation has committed, an explicit DT hardware reset must not be
+ * cancelled by an old/replayed BOOT frame still visible on the wire. */
+static bool spi_boot_rescue_pending;
+
+static void esp_spi_reboot_budget_sync_locked(struct esp_adapter *adapter)
+{
+	u32 epoch = (u32)atomic_read(&adapter->fw_boot_commit_epoch);
+
+	if (spi_reboot_budget_epoch != epoch) {
+		spi_reboot_budget_epoch = epoch;
+		atomic_set(&spi_soft_reboot_attempts, 0);
+	}
+}
+/* Distinct reboot generations reject ACKs retained from prior attempts. */
+static atomic_t spi_reboot_cmd_seq = ATOMIC_INIT(0);
 
 static struct sk_buff *esp_spi_alloc_skb(u32 len)
 {
@@ -200,7 +224,65 @@ static int esp_spi_reinit_after_fw_reset(struct esp_adapter *adapter)
 		return -EINVAL;
 	open_data_path();
 	atomic_set(&adapter->state, ESP_CONTEXT_READY);
+	/* A parsed boot TLV is insufficient to refill the retry budget.
+	 * WLAN/HCI/RCP publication still has to succeed. */
 	return 0;
+}
+
+static void esp_spi_commit_fw_recovery(struct esp_adapter *adapter)
+{
+	unsigned long flags;
+
+	/* The common epoch was advanced before invoking this callback. A new
+	 * reset may have charged the next epoch already; never erase it. */
+	spin_lock_irqsave(&spi_reboot_budget_lock, flags);
+	esp_spi_reboot_budget_sync_locked(adapter);
+	/* Boot-first rescue is only for the uncommitted incarnation present
+	 * when the SPI device initially binds. */
+	spi_boot_rescue_pending = false;
+	spin_unlock_irqrestore(&spi_reboot_budget_lock, flags);
+}
+
+static bool esp_spi_claim_boot_rescue(void)
+{
+	unsigned long flags;
+	bool rescue;
+
+	spin_lock_irqsave(&spi_reboot_budget_lock, flags);
+	rescue = spi_boot_rescue_pending;
+	spi_boot_rescue_pending = false;
+	spin_unlock_irqrestore(&spi_reboot_budget_lock, flags);
+	return rescue;
+}
+
+static void esp_spi_arm_boot_rescue(void)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&spi_reboot_budget_lock, flags);
+	spi_boot_rescue_pending = true;
+	spin_unlock_irqrestore(&spi_reboot_budget_lock, flags);
+}
+
+static void esp_spi_retire_boot_rescue(void)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&spi_reboot_budget_lock, flags);
+	spi_boot_rescue_pending = false;
+	spin_unlock_irqrestore(&spi_reboot_budget_lock, flags);
+}
+
+static void esp_spi_reset_binding_budget(struct esp_adapter *adapter)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&spi_reboot_budget_lock, flags);
+	spi_reboot_budget_epoch =
+		adapter ? (u32)atomic_read(&adapter->fw_boot_commit_epoch) : 0;
+	atomic_set(&spi_soft_reboot_attempts, 0);
+	spi_boot_rescue_pending = false;
+	spin_unlock_irqrestore(&spi_reboot_budget_lock, flags);
 }
 
 static int esp_spi_recover_transport(struct esp_adapter *adapter)
@@ -324,7 +406,10 @@ static void esp_spi_restore_startup_clock(void)
 {
 	u32 max_mhz;
 
-	spi_context.spi_clk_mhz = spi_context.requested_clk_mhz;
+	/* The firmware always starts in its default SPI mode. The first
+	 * boot event must be received at the safe bootstrap speed rather
+	 * than at the last incarnation's negotiated throughput clock. */
+	spi_context.spi_clk_mhz = SPI_BOOTSTRAP_CLK_MHZ;
 	max_mhz = spi_context.spi_max_hz / NUMBER_1M;
 	if (max_mhz && spi_context.spi_clk_mhz > max_mhz)
 		spi_context.spi_clk_mhz = min_t(u32, max_mhz, 255U);
@@ -377,15 +462,284 @@ out:
 	return ret;
 }
 
+/* Bootstrap reboot does not depend on a Wi-Fi device, the normal
+ * command queue, or a negotiated SPI clock. It runs exclusively inside the
+ * ordered SPI workqueue while ESP_SPI_RESETTING gates all normal traffic.
+ *
+ * A firmware ACK is meaningful only after a complete SPI transaction:
+ * firmware's post-transaction worker delays esp_restart() until the master
+ * has clocked the response off the wire. Unsupported old firmware times out
+ * safely; absence of an ACK must never be reported as success.
+ *
+ * Return: 0 = acknowledged reboot, 1 = valid pending boot event (no reboot),
+ * <0 = transport error / no explicit command response.
+ */
+/* Validate a complete bootstrap wire frame before classifying it as a
+ * boot event or accepting an ACK. Header ID alone is never sufficient. */
+static bool esp_spi_bootstrap_frame_valid(struct esp_adapter *adapter,
+					u8 *frame, bool boot, u16 *payload_len)
+{
+	struct esp_payload_header *hdr = (void *)frame;
+	struct esp_internal_bootup_event *evt;
+	u16 off = esp_wire_le16_to_cpu(hdr->offset);
+	u16 len = esp_wire_le16_to_cpu(hdr->len);
+	u16 rx_sum = esp_wire_le16_to_cpu(hdr->checksum);
+	/* CMD35 exists only in new firmware, which always checksums SPI
+	 * responses, even before boot capability negotiation. Do not accept an
+	 * unchecked all-zero checksum on the privileged reboot ACK path. */
+	bool needs_sum = !boot || rx_sum;
+	bool cap = false, chip = false, fw = false, clk = false;
+	u16 calc;
+	const u8 *pos;
+	int left;
+
+	(void)adapter;
+	if (hdr->if_type != ESP_INTERNAL_IF || !ESP_OFFSET_VALID(off) ||
+	    off > SPI_BUF_SIZE || !len || len > SPI_BUF_SIZE - off)
+		return false;
+	if (boot) {
+		if (hdr->packet_type != PACKET_TYPE_EVENT ||
+		    len < offsetof(struct esp_internal_bootup_event, data))
+			return false;
+		evt = (void *)(frame + off);
+		if (evt->header.event_code != ESP_INTERNAL_BOOTUP_EVENT ||
+		    evt->header.status ||
+		    evt->len > len - offsetof(struct esp_internal_bootup_event, data))
+			return false;
+		pos = evt->data;
+		left = evt->len;
+		while (left) {
+			u8 n, tag;
+
+			if (left < 2)
+				return false;
+			tag = pos[0];
+			n = pos[1];
+			if (n > left - 2)
+				return false;
+			switch (tag) {
+			case ESP_BOOTUP_CAPABILITY:
+				if (cap || (n != 1 && n != 2 && n != 4))
+					return false;
+				{
+					u32 capability = 0;
+
+					if (n == 1) {
+						capability = pos[2];
+					} else if (n == 2) {
+						__le16 cap16;
+
+						memcpy(&cap16, pos + 2, sizeof(cap16));
+						capability = le16_to_cpu(cap16);
+					} else {
+						__le32 cap32;
+
+						memcpy(&cap32, pos + 2, sizeof(cap32));
+						capability = le32_to_cpu(cap32);
+					}
+					if (!(capability & ESP_WLAN_SPI_SUPPORT))
+						return false;
+					if (capability & ESP_CHECKSUM_ENABLED)
+						needs_sum = true;
+				}
+				cap = true;
+				break;
+			case ESP_BOOTUP_FIRMWARE_CHIP_ID:
+				if (chip || n != 1 ||
+				    pos[2] == ESP_FIRMWARE_CHIP_UNRECOGNIZED)
+					return false;
+				chip = true;
+				break;
+			case ESP_BOOTUP_FW_DATA:
+				if (fw || n != sizeof(struct fw_data))
+					return false;
+				fw = true;
+				break;
+			case ESP_BOOTUP_SPI_CLK_MHZ:
+				if (clk || n != 1 || !pos[2])
+					return false;
+				clk = true;
+				break;
+			case ESP_BOOTUP_EXT_CAPABILITY:
+			case ESP_BOOTUP_RX_BUF_SIZE:
+				if (n != sizeof(u32))
+					return false;
+				break;
+			case ESP_BOOTUP_RCP_SESSION_NONCE:
+				if (n != sizeof(u64))
+					return false;
+				break;
+			default:
+				break;
+			}
+			pos += 2 + n;
+			left -= 2 + n;
+		}
+		if (!cap || !chip || !fw)
+			return false;
+	} else if (hdr->packet_type != PACKET_TYPE_COMMAND_RESPONSE ||
+		   len < sizeof(struct command_header)) {
+		return false;
+	}
+	if (needs_sum) {
+		hdr->checksum = 0;
+		calc = compute_checksum(frame, off + len);
+		hdr->checksum = esp_wire_cpu_to_le16(rx_sum);
+		if (calc != rx_sum)
+			return false;
+	}
+	*payload_len = len;
+	return true;
+}
+
+static int esp_spi_bootstrap_check_boot(struct esp_adapter *adapter,
+					struct sk_buff **pending_boot,
+					bool allow_firmware_reboot)
+{
+	struct spi_transfer trans = {};
+	struct esp_payload_header *wire;
+	struct command_header *cmd;
+	struct sk_buff *boot_skb = NULL;
+	u8 *tx, *rx;
+	unsigned long deadline;
+	bool sent = false;
+	bool ready, data_ready;
+	u16 reboot_seq = 0;
+	u16 frame_len = 0;
+	int ret = -ETIMEDOUT;
+	int n = 0;
+
+	if (!adapter || !spi_context.esp_spi_dev || !pending_boot)
+		return -ENODEV;
+	*pending_boot = NULL;
+	if (allow_firmware_reboot) {
+		/* Never reuse the same ACK sequence on consecutive attempts.
+		 * An old already-clocked response must not authorize a new reboot. */
+		reboot_seq = (u16)atomic_inc_return(&spi_reboot_cmd_seq);
+		if (!reboot_seq)
+			reboot_seq = (u16)atomic_inc_return(&spi_reboot_cmd_seq);
+	}
+	tx = kzalloc(SPI_BUF_SIZE, GFP_KERNEL);
+	rx = kzalloc(SPI_BUF_SIZE, GFP_KERNEL);
+	if (!tx || !rx) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	/* A slow bootstrap clock is required: there is no way to obtain
+	 * data over SPI without the Linux master supplying SCLK. */
+	spi_context.spi_clk_mhz = SPI_BOOTSTRAP_CLK_MHZ;
+	spi_context.esp_spi_dev->max_speed_hz =
+		SPI_BOOTSTRAP_CLK_MHZ * NUMBER_1M;
+	deadline = jiffies + msecs_to_jiffies(allow_firmware_reboot ?
+				 SPI_REBOOT_ACK_TIMEOUT_MS : 400);
+	while (time_before(jiffies, deadline)) {
+		ret = esp_spi_gpio_asserted(spi_context.handshake_gpio,
+					      "handshake", &ready);
+		if (ret)
+			goto out;
+		ret = esp_spi_gpio_asserted(spi_context.data_ready_gpio,
+					      "data-ready", &data_ready);
+		if (ret)
+			goto out;
+		if (!ready) {
+			msleep(10);
+			continue;
+		}
+
+		memset(tx, 0, SPI_BUF_SIZE);
+		memset(rx, 0, SPI_BUF_SIZE);
+		/* Inspect any already-advertised event before injecting a reboot.
+		 * The firmware may have queued BOOT before Linux bound its IRQ. */
+		if (allow_firmware_reboot && !sent && (!data_ready || n++ >= 8)) {
+			wire = (struct esp_payload_header *)tx;
+			wire->if_type = ESP_INTERNAL_IF;
+			wire->packet_type = PACKET_TYPE_COMMAND_REQUEST;
+			wire->offset = esp_wire_cpu_to_le16(sizeof(*wire));
+			wire->len = esp_wire_cpu_to_le16(sizeof(*cmd));
+			cmd = (struct command_header *)(tx + sizeof(*wire));
+			cmd->cmd_code = CMD_HOST_REBOOT;
+			cmd->seq_num = esp_wire_cpu_to_le16(reboot_seq);
+			wire->checksum = esp_wire_cpu_to_le16(
+				compute_checksum(tx, sizeof(*wire) + sizeof(*cmd)));
+			sent = true;
+			esp_info("SPI software reboot requested at %u MHz seq=%u; awaiting wire ACK\n",
+				 SPI_BOOTSTRAP_CLK_MHZ, reboot_seq);
+		}
+		trans.tx_buf = tx;
+		trans.rx_buf = rx;
+		trans.len = SPI_BUF_SIZE;
+		trans.speed_hz = SPI_BOOTSTRAP_CLK_MHZ * NUMBER_1M;
+		ret = spi_sync_transfer(spi_context.esp_spi_dev, &trans, 1);
+		if (ret)
+			goto out;
+
+		wire = (struct esp_payload_header *)rx;
+		if (!sent && wire->if_type == ESP_INTERNAL_IF &&
+		    wire->packet_type == PACKET_TYPE_EVENT &&
+		    esp_spi_bootstrap_frame_valid(adapter, rx, true,
+							  &frame_len)) {
+			/* Preserve the published event and let the common boot event
+			 * worker validate TLVs and reconstruct interfaces. */
+			boot_skb = esp_spi_alloc_skb(SPI_BUF_SIZE);
+			if (!boot_skb) {
+				ret = -ENOMEM;
+				goto out;
+			}
+			skb_put_data(boot_skb, rx, SPI_BUF_SIZE);
+			*pending_boot = boot_skb;
+			ret = 1;
+			goto out;
+		}
+		if (sent && wire->if_type == ESP_INTERNAL_IF &&
+		    wire->packet_type == PACKET_TYPE_COMMAND_RESPONSE &&
+		    esp_spi_bootstrap_frame_valid(adapter, rx, false,
+							  &frame_len)) {
+			cmd = (struct command_header *)(rx +
+					esp_wire_le16_to_cpu(wire->offset));
+			if (frame_len == sizeof(*cmd) &&
+			    esp_wire_le16_to_cpu(cmd->len) == 0 &&
+			    cmd->reserved1 == 0 && cmd->reserved2 == 0 &&
+			    cmd->cmd_code == CMD_HOST_REBOOT &&
+			    esp_wire_le16_to_cpu(cmd->seq_num) == reboot_seq) {
+				ret = cmd->cmd_status == CMD_RESPONSE_SUCCESS ? 0 : -EIO;
+				goto out;
+			}
+		}
+		msleep(5);
+	}
+	ret = allow_firmware_reboot ? -ETIMEDOUT : -ENODATA;
+out:
+	kfree(rx);
+	kfree(tx);
+	return ret;
+}
+
 static void esp_spi_reset_work(struct work_struct *work)
 {
 	struct esp_spi_context *context =
 		container_of(work, struct esp_spi_context, reset_work);
 	struct esp_adapter *adapter = context->adapter;
+	struct sk_buff *pending_boot = NULL;
 	int ret;
 
-	ret = esp_spi_hw_reset(adapter);
-	if (ret) {
+	if (context->reset_gpio) {
+		/* Boot-first rescue applies only while the initial probe has never
+		 * committed an incarnation. Once Linux explicitly decides a running
+		 * incarnation must die, a queued/replayed BOOT frame cannot cancel
+		 * the requested physical reset. */
+		if (esp_spi_claim_boot_rescue())
+			ret = esp_spi_bootstrap_check_boot(adapter, &pending_boot, false);
+		else
+			ret = -ENODATA;
+		if (ret != 1)
+			ret = esp_spi_hw_reset(adapter);
+	} else {
+		ret = esp_spi_bootstrap_check_boot(adapter, &pending_boot, true);
+	}
+	/* Do not reset the attempt budget on a command ACK: the firmware
+	 * could acknowledge repeatedly yet never deliver a fresh boot event.
+	 * The accepted boot event (reinit callback) releases the budget. */
+	if (ret < 0) {
 		if (ret != -ESHUTDOWN && adapter) {
 			set_bit(ESP_FW_RESTART_NEEDED, &adapter->state_flags);
 			esp_err("SPI target reset failed: %d\n", ret);
@@ -395,6 +749,24 @@ static void esp_spi_reset_work(struct work_struct *work)
 	}
 
 	clear_bit(ESP_SPI_RESETTING, &context->spi_flags);
+	if (ret == 1 && pending_boot) {
+		/* Boot-event-first has already checked complete wire bounds,
+		 * checksum and required boot TLVs. Enqueue can still fail. */
+		data_path = OPEN_DATAPATH;
+		if (process_rx_buf(pending_boot, true)) {
+			dev_kfree_skb(pending_boot);
+			set_bit(ESP_FW_RESTART_NEEDED, &adapter->state_flags);
+			esp_err("SPI pending boot enqueue failed; preserving reset intent\n");
+		}
+	} else if (ret == 0 && !context->reset_gpio) {
+		/* The ACK only proves that firmware accepted CMD35. Its post-transfer
+		 * task deliberately restarts a little later. Keep the ordinary datapath
+		 * closed during that interval so old-incarnation HCI/RCP/internal frames
+		 * cannot cross the reincarnation boundary. recover_transport() reopens
+		 * SPI when it is time to wait for the fresh BOOT TLV. */
+		esp_info("SPI CMD_HOST_REBOOT wire ACK accepted; holding datapath closed for new boot TLV\n");
+		data_path = CLOSE_DATAPATH;
+	}
 
 	/*
 	 * The reset work is ordered behind all SPI transactions. Restart the
@@ -410,28 +782,51 @@ static void esp_spi_reset_work(struct work_struct *work)
 
 static int esp_spi_reset_target(struct esp_adapter *adapter)
 {
+	unsigned long flags;
+	u32 attempt_epoch;
+	bool software_reset;
+
 	if (!adapter || adapter != spi_context.adapter)
 		return -EINVAL;
 	if (test_bit(ESP_DRIVER_UNLOADING, &adapter->state_flags) ||
 	    test_bit(ESP_TRANSPORT_REMOVING, &adapter->state_flags))
 		return -ESHUTDOWN;
-	if (!spi_context.reset_gpio || !spi_context.spi_workqueue)
+	if (!spi_context.spi_workqueue)
 		return -ENODEV;
 
-	/*
-	 * Gate new transfers before queueing reset. reset_work shares the ordered
-	 * SPI workqueue with spi_work, so any transfer already in flight finishes
-	 * first and no later transfer can start until reset has completed.
-	 */
-	if (test_and_set_bit(ESP_SPI_RESETTING, &spi_context.spi_flags))
+	/* A delayed commit callback must not erase a new incarnation's reboot,
+	 * or let an inherited count reject its first attempt. Serialize both
+	 * the generation check and the in-flight reset gate. */
+	spin_lock_irqsave(&spi_reboot_budget_lock, flags);
+	esp_spi_reboot_budget_sync_locked(adapter);
+	if (test_bit(ESP_SPI_RESETTING, &spi_context.spi_flags)) {
+		spin_unlock_irqrestore(&spi_reboot_budget_lock, flags);
 		return 0;
+	}
+	software_reset = !spi_context.reset_gpio;
+	if (software_reset &&
+	    atomic_read(&spi_soft_reboot_attempts) >= ESP_FW_BOOT_MAX_ATTEMPTS) {
+		spin_unlock_irqrestore(&spi_reboot_budget_lock, flags);
+		return -EHOSTUNREACH;
+	}
+	set_bit(ESP_SPI_RESETTING, &spi_context.spi_flags);
+	attempt_epoch = spi_reboot_budget_epoch;
+	if (software_reset)
+		atomic_inc(&spi_soft_reboot_attempts);
+	spin_unlock_irqrestore(&spi_reboot_budget_lock, flags);
 
 	data_path = CLOSE_DATAPATH;
 	if (atomic_read(&adapter->state) > ESP_CONTEXT_RX_READY)
 		atomic_set(&adapter->state, ESP_CONTEXT_RX_READY);
 
 	if (!queue_work(spi_context.spi_workqueue, &spi_context.reset_work)) {
+		spin_lock_irqsave(&spi_reboot_budget_lock, flags);
 		clear_bit(ESP_SPI_RESETTING, &spi_context.spi_flags);
+		/* No new reset was queued. Roll back only the current epoch. */
+		if (software_reset && spi_reboot_budget_epoch == attempt_epoch &&
+		    atomic_read(&spi_soft_reboot_attempts) > 0)
+			atomic_dec(&spi_soft_reboot_attempts);
+		spin_unlock_irqrestore(&spi_reboot_budget_lock, flags);
 		return -EBUSY;
 	}
 	return 0;
@@ -443,6 +838,7 @@ static struct esp_if_ops if_ops = {
 	.alloc_skb	= esp_spi_alloc_skb,
 	.quiesce_for_fw_reset = esp_spi_quiesce_for_fw_reset,
 	.reinit_after_fw_reset = esp_spi_reinit_after_fw_reset,
+	.commit_fw_recovery = esp_spi_commit_fw_recovery,
 	.reset_target = esp_spi_reset_target,
 	.recover_transport = esp_spi_recover_transport,
 	.flush_bt_traffic = esp_spi_flush_bt_traffic,
@@ -795,6 +1191,20 @@ static int process_rx_buf(struct sk_buff *skb, bool rx_pending)
 		esp_spi_fail_rcp_rx("invalid length/offset");
 		return -EINVAL;
 	}
+	/* The initial boot-first exception ends as soon as a BOOT frame is
+	 * actually consumed from the wire. If reconstruction later fails, the
+	 * ensuing explicit hardware reset is authoritative and cannot be cancelled
+	 * by another stale/replayed BOOT frame from the same incarnation. */
+	if (header->if_type == ESP_INTERNAL_IF &&
+	    header->packet_type == PACKET_TYPE_EVENT &&
+	    len >= sizeof(struct event_header)) {
+		const struct event_header *event =
+			(const struct event_header *)(skb->data + offset);
+
+		if (event->event_code == ESP_INTERNAL_BOOTUP_EVENT)
+			esp_spi_retire_boot_rescue();
+	}
+
 	len += offset;
 	skb_trim(skb, len);
 	if (!data_path) {
@@ -1071,11 +1481,18 @@ static int esp_spi_probe(struct spi_device *spi)
 		goto err_clear_dev;
 	}
 
+	/* clockspeed= is the historical initial/pre-negotiation host rate, not
+	 * a permanent ceiling on the firmware-advertised operating clock. Keep
+	 * the configured value only so a firmware that omits the optional clock
+	 * TLV can return from the 1 MHz boot-safe rate to the old startup rate. */
 	requested_hz = (u32)spi_context.requested_clk_mhz * NUMBER_1M;
-	if (requested_hz > spi_context.spi_max_hz)
-		esp_warn("SPI clock %u MHz exceeds Device Tree cap %u Hz; capping to %u MHz\n",
+	if (spi_context.requested_clk_mhz &&
+	    requested_hz > spi_context.spi_max_hz)
+		esp_warn("Initial SPI clock %u MHz exceeds Device Tree cap %u Hz; fallback will be limited to %u MHz\n",
 			 spi_context.requested_clk_mhz, spi_context.spi_max_hz, max_mhz);
-	esp_spi_restore_startup_clock();
+	/* Clock the pending boot event at 1 MHz regardless of the requested
+	 * steady-state rate. The validated boot TLV triggers negotiation. */
+	spi_context.spi_clk_mhz = SPI_BOOTSTRAP_CLK_MHZ;
 
 	if (device_property_read_bool(&spi->dev, "spi-cs-high")) {
 		/*
@@ -1127,8 +1544,10 @@ static int esp_spi_probe(struct spi_device *spi)
 	set_bit(ESP_SPI_BUS_CLAIMED, &spi_context.spi_flags);
 	set_bit(ESP_SPI_BUS_SET, &spi_context.spi_flags);
 
+	/* EN is optional: an already-running ESP can publish its boot event
+	 * without ever being reset. Only reset if the bounded boot probe fails. */
 	spi_context.reset_gpio =
-		devm_gpiod_get(&spi->dev, "reset", GPIOD_IN);
+		devm_gpiod_get_optional(&spi->dev, "reset", GPIOD_IN);
 	if (IS_ERR(spi_context.reset_gpio)) {
 		status = PTR_ERR(spi_context.reset_gpio);
 		spi_context.reset_gpio = NULL;
@@ -1188,19 +1607,23 @@ static int esp_spi_probe(struct spi_device *spi)
 	set_bit(ESP_SPI_GPIO_DR_IRQ_DONE, &spi_context.spi_flags);
 
 	/*
-	 * All providers and IRQ resources are now proven. Temporarily release the
-	 * persistent removal quarantine only for the transport-owned reset. If
-	 * reset fails, err_clear_dev publishes removal again before returning.
+	 * Do not reset during probe: firmware may already have a valid boot
+	 * event queued on the data-ready line. Probe it first at 1 MHz; the
+	 * common watchdog requests hardware reset only if no boot event arrives.
+	 * A reset GPIO, when described in DT, remains available for that path.
 	 */
 	clear_bit(ESP_TRANSPORT_REMOVING, &spi_context.adapter->state_flags);
 	clear_bit(ESP_CLEANUP_IN_PROGRESS, &spi_context.adapter->state_flags);
-	status = esp_spi_hw_reset(spi_context.adapter);
-	if (status)
-		goto err_clear_dev;
+	esp_info("SPI boot event probe at %u MHz (DT reset %s)\n",
+		 SPI_BOOTSTRAP_CLK_MHZ,
+		 spi_context.reset_gpio ? "available" : "absent");
 
-	/* Fresh physical reset starts a new transport incarnation. Publish the
-	 * binding only now, and stay RX_READY until the boot TLV reconstructs
-	 * and commits the card. */
+	/* A reprobe is a fresh host binding, not a continuation of an exhausted
+	 * recovery episode. Reset both common and SPI-local retry budgets before
+	 * granting the one initial boot-first rescue token. */
+	esp_reset_boot_recovery_for_binding(spi_context.adapter, false);
+	esp_spi_reset_binding_budget(spi_context.adapter);
+	esp_spi_arm_boot_rescue();
 	clear_bit(ESP_INIT_DONE, &spi_context.adapter->state_flags);
 	clear_bit(ESP_FW_RECOVERY_PENDING, &spi_context.adapter->state_flags);
 	clear_bit(ESP_FW_RESET_EXPECTED, &spi_context.adapter->state_flags);
@@ -1386,6 +1809,7 @@ static int spi_init(void)
 	}
 	INIT_WORK(&spi_context.spi_work, esp_spi_work);
 	INIT_WORK(&spi_context.reset_work, esp_spi_reset_work);
+	atomic_set(&spi_soft_reboot_attempts, 0);
 	for (prio_q_idx = 0; prio_q_idx < MAX_PRIORITY_QUEUES; prio_q_idx++) {
 		skb_queue_head_init(&spi_context.tx_q[prio_q_idx]);
 		skb_queue_head_init(&spi_context.rx_q[prio_q_idx]);
@@ -1440,6 +1864,9 @@ static void adjust_spi_clock(u8 spi_clk_mhz)
 		spi_clk_mhz = min_t(u32, max_mhz, 255U);
 	}
 
+	/* Preserve master-compatible semantics: a valid firmware boot TLV owns
+	 * the steady-state rate. clockspeed= only selected the pre-negotiation
+	 * startup/fallback rate; Device Tree remains the board safety ceiling. */
 	if (spi_clk_mhz != spi_context.spi_clk_mhz) {
 		esp_info("ESP Reconfigure SPI CLK to %u MHz\n", spi_clk_mhz);
 		spi_context.spi_clk_mhz = spi_clk_mhz;
@@ -1450,6 +1877,15 @@ static void adjust_spi_clock(u8 spi_clk_mhz)
 
 int esp_adjust_spi_clock(struct esp_adapter *adapter, u8 spi_clk_mhz)
 {
+	if (!adapter || adapter != spi_context.adapter)
+		return -EINVAL;
+
+	/* Internal zero means the optional BOOT clock TLV was absent. Restore the
+	 * historical initial host rate instead of leaving recovery/bootstrap at
+	 * 1 MHz forever. A real firmware TLV of zero is rejected by main.c. */
+	if (!spi_clk_mhz)
+		spi_clk_mhz = spi_context.requested_clk_mhz ?
+			spi_context.requested_clk_mhz : SPI_INITIAL_CLK_MHZ;
 	adjust_spi_clock(spi_clk_mhz);
 	return 0;
 }
@@ -1474,8 +1910,11 @@ int esp_init_interface_layer(struct esp_adapter *adapter, u32 speed)
 			 speed, SPI_MAX_CLK_MHZ);
 		speed = SPI_MAX_CLK_MHZ;
 	}
-	spi_context.requested_clk_mhz = speed ? speed : SPI_INITIAL_CLK_MHZ;
-	spi_context.spi_clk_mhz = spi_context.requested_clk_mhz;
+	/* Preserve master semantics: clockspeed= selects only the initial host
+	 * rate. The BOOT clock TLV may later select a higher operating rate.
+	 * Store zero as "use historical 10 MHz fallback" after boot-safe receive. */
+	spi_context.requested_clk_mhz = speed;
+	spi_context.spi_clk_mhz = speed ? speed : SPI_INITIAL_CLK_MHZ;
 	return spi_init();
 }
 

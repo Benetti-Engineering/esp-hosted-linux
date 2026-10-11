@@ -52,13 +52,21 @@ Use the ESP-side signal assignments and pull-up guidance from [Hardware setup](.
 | ESP reset | 31 |
 | Ground | 39 |
 
-Enable the SDIO overlay in the active Raspberry Pi `config.txt`:
+For production SDIO recovery with host-controlled ESP EN, first install
+`host/overlays/esp32-sdio-pwrseq.dtbo` into the Raspberry Pi boot overlays
+directory, then enable the reset pwrseq **before** the SDIO overlay in the active
+`config.txt`:
 
 ```text
+dtoverlay=esp32-sdio-pwrseq
 dtoverlay=sdio,poll_once=off
 ```
 
-Reboot after changing it.
+The ESP overlay marks the MMC host with `espressif,full-chip-reset`; the Linux
+driver will only treat `mmc_hw_reset()` as a firmware reincarnation when that
+explicit marker and a bound pwrseq are both present. Reboot after changing the
+boot Device Tree. Without this overlay, SDIO remains supported and recovery uses
+the generation-ACKed in-band software reboot fallback.
 
 ## USB reference connection
 
@@ -109,7 +117,9 @@ From `host/`:
 ./rpi_init.sh usb
 ```
 
-The helper combines the common module build/load flow with Raspberry Pi-specific bus and GPIO setup. For SPI, it compiles and applies the Device Tree overlay (`overlays/esp32-spi.dtbo` and `spidev_disabler.dtbo`) using BCM6 for ESP reset, BCM22 for Handshake, and BCM27 for Data Ready unless overridden. For SDIO, reset is handled in-band after enumeration. For USB, no GPIO or Device Tree setup is required; `./rpi_init.sh usb` builds and loads `esp32_usb.ko`, and the USB core binds the device when connected.
+The helper combines the common module build/load flow with Raspberry Pi-specific bus and GPIO setup. For SPI, it compiles and applies the Device Tree overlay (`overlays/esp32-spi.dtbo` and `spidev_disabler.dtbo`) using BCM6 for ESP reset, BCM22 for Handshake, and BCM27 for Data Ready unless overridden. For SDIO, it builds `overlays/esp32-sdio-pwrseq.dtbo` when `dtc` is available and, after loading the driver, waits briefly for the ESP SDIO function to bind before verifying the full-chip-reset marker on that controller ancestry; neither `dtc` nor the hardware-reset overlay is required for the acknowledged software-reboot fallback. For USB, no GPIO or Device Tree setup is required; `./rpi_init.sh usb` builds and loads `esp32_usb.ko`, and the USB core binds the device when connected.
+
+The **default** SPI and SDIO reference mappings conflict: Raspberry Pi SDIO uses BCM22..27, while default ESP SPI uses BCM22/27 for Handshake/Data Ready, and the ESP SDIO pwrseq uses BCM6, the default SPI reset. The helper reads the live SDIO `brcm,pins` group and pwrseq reset GPIO and refuses SPI only when those boot-owned GPIOs overlap SPI0 (GPIO7..11) or the selected ESP control GPIOs. Alternate Raspberry Pi SDIO groups such as GPIO34..39 can therefore coexist with SPI when the complete GPIO sets are disjoint. Unknown/custom active SDIO pinmuxes still fail closed.
 
 Useful arguments include:
 

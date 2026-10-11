@@ -195,6 +195,7 @@ typedef struct {
     uint8_t *dma_tx;
     bool in_use;
     bool is_raw_tp;
+    bool reboot_ack;
     uint32_t raw_tp_run_id;
 } spi_slot_t;
 
@@ -625,6 +626,7 @@ static void queue_next_transaction(void)
     /* 3. Mark slot in use BEFORE dequeuing TX buffer, guaranteeing resources are held */
     slot->in_use = true;
     slot->is_raw_tp = false;
+    slot->reboot_ack = false;
     slot->raw_tp_run_id = 0;
 
     /* 4. Dequeue next TX buffer if available */
@@ -632,6 +634,27 @@ static void queue_next_transaction(void)
     if (has_tx) {
         slot->is_raw_tp = (buf_handle.if_type == ESP_TEST_IF);
         slot->raw_tp_run_id = buf_handle.raw_tp_run_id;
+        if (buf_handle.if_type == ESP_INTERNAL_IF &&
+            buf_handle.payload_len >=
+                sizeof(struct esp_payload_header) + sizeof(struct command_header)) {
+            /* esp_spi_write() already placed the real wire header in
+             * this queued payload; buf_handle.pkt_type is not populated
+             * in the transport queue item. */
+            const struct esp_payload_header *wire =
+                (const struct esp_payload_header *)buf_handle.payload;
+            uint16_t offset = le16toh(wire->offset);
+            if (wire->if_type == ESP_INTERNAL_IF &&
+                wire->packet_type == PACKET_TYPE_COMMAND_RESPONSE &&
+                ESP_OFFSET_VALID(offset) &&
+                offset <= buf_handle.payload_len &&
+                sizeof(struct command_header) <=
+                    buf_handle.payload_len - offset) {
+                const struct command_header *cmd =
+                    (const struct command_header *)(buf_handle.payload + offset);
+                slot->reboot_ack = cmd->cmd_code == CMD_HOST_REBOOT &&
+                                   cmd->cmd_status == CMD_RESPONSE_SUCCESS;
+            }
+        }
 
         memcpy(slot->dma_tx, buf_handle.payload, buf_handle.payload_len);
         if (buf_handle.payload_len < RX_BUF_SIZE) {
@@ -687,10 +710,12 @@ static void spi_transaction_post_process_task(void* pvParameters)
     interface_buffer_handle_t rx_buf_handle = {0};
 
     for (;;) {
+        bool reboot_after_ack = false;
+
         memset(&rx_buf_handle, 0, sizeof(rx_buf_handle));
 
         /* Await transmission result, after any kind of transmission a new packet
-         * (dummy or real) must be placed in SPI slave
+         * (dummy or real) must normally be placed in SPI slave.
          */
         ret = spi_slave_get_trans_result(ESP_SPI_CONTROLLER, &spi_trans,
                                          portMAX_DELAY);
@@ -707,19 +732,30 @@ static void spi_transaction_post_process_task(void* pvParameters)
             xSemaphoreTake(wait_cs_deassert_sem, portMAX_DELAY);
         }
 #endif
-        /* Queue new transaction to get ready as soon as possible */
-        queue_next_transaction();
+
+        if (spi_trans && spi_trans->user) {
+            slot = (spi_slot_t *)spi_trans->user;
+            reboot_after_ack = slot->reboot_ack;
+        } else {
+            slot = NULL;
+        }
+
+        /* CMD35 is a reincarnation fence only after its ACK transaction
+         * completed successfully. If that transaction failed, no reboot was
+         * authorized and the slave must keep servicing SPI normally. */
+        if (ret != ESP_OK || !reboot_after_ack)
+            queue_next_transaction();
 
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "spi transmit error, ret : 0x%x\r\n", ret);
-            if (spi_trans && spi_trans->user) {
-                slot = (spi_slot_t *)spi_trans->user;
+            if (slot) {
                 if (slot->is_raw_tp) {
                     debug_raw_tp_tx_failed(1);
                 }
                 if (spi_trans->rx_buffer) {
                     recycle_spi_rx_buf((uint8_t *)spi_trans->rx_buffer);
                 }
+                slot->reboot_ack = false;
                 slot->in_use = false;
             }
             continue;
@@ -730,10 +766,24 @@ static void spi_transaction_post_process_task(void* pvParameters)
             continue;
         }
 
-        slot = (spi_slot_t *)spi_trans->user;
-
         if (slot && slot->is_raw_tp) {
             debug_raw_tp_tx_complete(1);
+        }
+
+        if (reboot_after_ack) {
+            /* Ignore the host MOSI side of the ACK-clocking transaction. It
+             * belongs to the old incarnation and must not cause new side effects
+             * while a full firmware restart is already committed. */
+            if (spi_trans->rx_buffer)
+                recycle_spi_rx_buf((uint8_t *)spi_trans->rx_buffer);
+            if (slot) {
+                slot->reboot_ack = false;
+                slot->in_use = false;
+            }
+            ESP_LOGW(TAG, "HOST_REBOOT ACK delivered over SPI; restarting firmware");
+            vTaskDelay(pdMS_TO_TICKS(50));
+            esp_restart();
+            continue;
         }
 
         if (spi_trans->rx_buffer) {
@@ -748,6 +798,7 @@ static void spi_transaction_post_process_task(void* pvParameters)
         }
 
         if (slot) {
+            slot->reboot_ack = false;
             slot->in_use = false;
         }
     }
@@ -991,6 +1042,20 @@ static int32_t esp_spi_write(interface_handle_t *handle, interface_buffer_handle
 #if CONFIG_ESP_SPI_CHECKSUM
     header->checksum = htole16(compute_checksum(tx_buf_handle.payload,
                                                 total_len));
+#else
+    /* The privileged CMD_HOST_REBOOT (35) ACK is always checksummed.
+     * With CONFIG_ESP_SPI_CHECKSUM=n ordinary SPI frames remain unchecked,
+     * but bootstrap recovery must never accept a corrupted reboot ACK.
+     * The host expects this checksum even before boot negotiation. */
+    if (header->if_type == ESP_INTERNAL_IF &&
+        header->packet_type == PACKET_TYPE_COMMAND_RESPONSE &&
+        buf_handle->payload_len >= sizeof(struct command_header)) {
+        const struct command_header *cmd =
+            (const struct command_header *)(tx_buf_handle.payload + wire_offset);
+        if (cmd->cmd_code == CMD_HOST_REBOOT)
+            header->checksum = htole16(compute_checksum(tx_buf_handle.payload,
+                                                        total_len));
+    }
 #endif
 
     if (header->if_type == ESP_INTERNAL_IF) {

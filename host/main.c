@@ -150,6 +150,7 @@ MODULE_PARM_DESC(radio_service_active,
 
 static void deinit_adapter(void);
 static int esp_publish_network_ifaces(struct esp_adapter *adapter);
+static void esp_finish_reconstruction(struct esp_adapter *adapter);
 
 
 static struct multicast_list mcast_list = {0};
@@ -235,38 +236,103 @@ void esp_schedule_fw_reset_recovery(struct esp_adapter *adapter)
 	esp_schedule_recovery(adapter, ESP_FW_RECOVERY_QUIET_MS, false, true);
 }
 
-void esp_request_firmware_restart(struct esp_adapter *adapter)
+/* A physical driver binding is a new host-side recovery episode. SPI never
+ * re-enumerates as part of its own reset, so it always starts clean. SDIO may
+ * disappear/reprobe while mmc_hw_reset() is still the active counted attempt;
+ * preserve that episode only while its deadline is armed and it is not already
+ * terminal. */
+void esp_reset_boot_recovery_for_binding(struct esp_adapter *adapter,
+		bool preserve_active_reset)
 {
-	int ret = -ENODEV;
+	unsigned long flags;
+	bool active_reset;
 
 	if (!adapter)
 		return;
 
-	set_bit(ESP_FW_RESTART_NEEDED, &adapter->state_flags);
-
-	if (adapter->if_context)
-		ret = generate_slave_intr(adapter->if_context,
-					  BIT(ESP_CLOSE_DATA_PATH));
-
-	/* SPI has no in-band CLOSE_DATA_PATH interrupt. Its transport-owned
-	 * reset-gpios descriptor is the single production reset authority. */
-	if (adapter->if_type == ESP_IF_TYPE_SPI) {
-		ret = -ENODEV;
-		if (adapter->if_ops && adapter->if_ops->reset_target)
-			ret = adapter->if_ops->reset_target(adapter);
-		if (ret)
-			esp_err("SPI firmware restart requested without usable reset-gpios: %d\n",
-				ret);
-		/*
-		 * reset_target() is asynchronous. ESP_FW_RESTART_NEEDED remains
-		 * asserted until the transport reset worker confirms completion.
-		 */
-	} else if (ret == 0) {
+	spin_lock_irqsave(&adapter->fw_recovery_lock, flags);
+	active_reset = adapter->fw_boot_deadline &&
+		test_bit(ESP_FW_RESET_EXPECTED, &adapter->state_flags) &&
+		!test_bit(ESP_FW_RECOVERY_EXHAUSTED, &adapter->state_flags);
+	if (!preserve_active_reset || !active_reset) {
+		adapter->fw_boot_reset_attempts = 0;
+		adapter->fw_boot_deadline = 0;
+		adapter->fw_recovery_backoff_ms = ESP_FW_RECOVERY_QUIET_MS;
+		clear_bit(ESP_FW_RECOVERY_EXHAUSTED, &adapter->state_flags);
+		clear_bit(ESP_FW_RECOVERY_PENDING, &adapter->state_flags);
+		clear_bit(ESP_FW_RESET_EXPECTED, &adapter->state_flags);
 		clear_bit(ESP_FW_RESTART_NEEDED, &adapter->state_flags);
-	} else {
-		esp_info("CLOSE_DATA_PATH failed %d; scheduled for retry in transport recovery\n",
-			 ret);
+		clear_bit(ESP_ALLOW_RECONSTRUCT, &adapter->state_flags);
+		clear_bit(ESP_CLEANUP_IN_PROGRESS, &adapter->state_flags);
 	}
+	spin_unlock_irqrestore(&adapter->fw_recovery_lock, flags);
+}
+
+void esp_request_firmware_restart(struct esp_adapter *adapter)
+{
+	unsigned long flags;
+	int ret = -ENODEV;
+	unsigned int attempt;
+
+	if (!adapter)
+		return;
+
+	/* A reset already queued/ACKed keeps its deadline armed until commit
+	 * or the watchdog explicitly expires it. Transport/RCP error storms
+	 * must not turn one physical reset into three global attempts. The
+	 * watchdog clears the deadline before dispatching a real retry. */
+	spin_lock_irqsave(&adapter->fw_recovery_lock, flags);
+	if (adapter->fw_boot_deadline) {
+		spin_unlock_irqrestore(&adapter->fw_recovery_lock, flags);
+		esp_info("Coalescing duplicate reboot request into active attempt\n");
+		return;
+	}
+	/* Only fully published firmware reconstruction replenishes the budget,
+	 * never the transport ACK or duplicate caller. */
+	if (test_bit(ESP_FW_RECOVERY_EXHAUSTED, &adapter->state_flags) ||
+	    adapter->fw_boot_reset_attempts >= ESP_FW_BOOT_MAX_ATTEMPTS) {
+		set_bit(ESP_FW_RECOVERY_EXHAUSTED, &adapter->state_flags);
+		adapter->fw_boot_deadline = 0;
+		spin_unlock_irqrestore(&adapter->fw_recovery_lock, flags);
+		esp_err("Firmware recovery exhausted %u resets; terminal failure\n",
+			ESP_FW_BOOT_MAX_ATTEMPTS);
+		return;
+	}
+	attempt = ++adapter->fw_boot_reset_attempts;
+	adapter->fw_boot_deadline =
+		jiffies + msecs_to_jiffies(ESP_FW_BOOT_ACK_TIMEOUT_MS);
+	set_bit(ESP_FW_RESTART_NEEDED, &adapter->state_flags);
+	spin_unlock_irqrestore(&adapter->fw_recovery_lock, flags);
+	esp_info("Firmware reboot attempt %u/%u; new boot deadline %u ms\n",
+		 attempt, ESP_FW_BOOT_MAX_ATTEMPTS, ESP_FW_BOOT_ACK_TIMEOUT_MS);
+
+	/* SPI and SDIO transport backends own both choices:
+	 * (a) DT-controlled ESP EN, and (b) generation/sequence-ACKed firmware
+	 * reboot when no hardware reset exists. Never bypass their ACK by
+	 * issuing an unacknowledged CLOSE_DATA_PATH interrupt on failure.
+	 * The accepted request is asynchronous; a new boot TLV completes it. */
+	if (adapter->if_type == ESP_IF_TYPE_SPI ||
+	    adapter->if_type == ESP_IF_TYPE_SDIO) {
+		if (!adapter->if_ops || !adapter->if_ops->reset_target) {
+			esp_err("Transport has no physical/software reset provider\n");
+			return;
+		}
+		ret = adapter->if_ops->reset_target(adapter);
+		if (ret)
+			esp_err("Transport reset request rejected: %d\n", ret);
+		return;
+	}
+
+	/* USB already acknowledges the SOFT_RESET vendor control request.
+	 * The firmware later calls esp_restart(); the new boot TLV is still
+	 * authoritative for completion. */
+	ret = adapter->if_context ?
+		generate_slave_intr(adapter->if_context,
+					 BIT(ESP_CLOSE_DATA_PATH)) : -ENODEV;
+	if (!ret)
+		clear_bit(ESP_FW_RESTART_NEEDED, &adapter->state_flags);
+	else
+		esp_warn("Firmware reboot control request failed %d\n", ret);
 }
 
 static void esp_bootup_request_retry(struct esp_adapter *adapter)
@@ -301,21 +367,36 @@ static void esp_fw_recovery_work(struct work_struct *work)
 	u32 gen;
 
 	if (test_bit(ESP_DRIVER_UNLOADING, &adapter->state_flags) ||
-	    test_bit(ESP_TRANSPORT_REMOVING, &adapter->state_flags))
+	    test_bit(ESP_TRANSPORT_REMOVING, &adapter->state_flags) ||
+	    test_bit(ESP_FW_RECOVERY_EXHAUSTED, &adapter->state_flags))
 		return;
 
 	spin_lock_irqsave(&adapter->fw_recovery_lock, flags);
 	skip = test_bit(ESP_INIT_DONE, &adapter->state_flags) &&
 	       !test_bit(ESP_FW_RECOVERY_PENDING, &adapter->state_flags) &&
 	       !test_bit(ESP_FW_RESET_EXPECTED, &adapter->state_flags);
+	/* Check the reset→committed-boot deadline *before* cleanup and
+	 * reconstruct early-exits. Those bits can remain set after a lost
+	 * post-ACK boot event; bypassing this check stalled recovery forever. */
+	if (!skip && adapter->fw_boot_deadline &&
+	    time_after_eq(jiffies, adapter->fw_boot_deadline)) {
+		adapter->fw_boot_deadline = 0;
+		spin_unlock_irqrestore(&adapter->fw_recovery_lock, flags);
+		esp_err("ACK/reset boot deadline elapsed without commit; bounded retry\n");
+		esp_bootup_request_retry(adapter);
+		return;
+	}
 	if (!skip && test_bit(ESP_CLEANUP_IN_PROGRESS, &adapter->state_flags)) {
 		spin_unlock_irqrestore(&adapter->fw_recovery_lock, flags);
-		esp_schedule_recovery(adapter, ESP_FW_RECOVERY_WATCHDOG_MS,
-				      false, false);
+		/* Guarantee another deadline check even while cleanup remains set. */
+		mod_delayed_work(system_wq, &adapter->fw_recovery_work,
+				 msecs_to_jiffies(ESP_FW_RECOVERY_WATCHDOG_MS));
 		return;
 	}
 	if (!skip && test_bit(ESP_ALLOW_RECONSTRUCT, &adapter->state_flags)) {
 		spin_unlock_irqrestore(&adapter->fw_recovery_lock, flags);
+		mod_delayed_work(system_wq, &adapter->fw_recovery_work,
+				 msecs_to_jiffies(ESP_FW_RECOVERY_WATCHDOG_MS));
 		return;
 	}
 	if (skip) {
@@ -356,7 +437,8 @@ static void esp_fw_recovery_work(struct work_struct *work)
 			ret, delay);
 		/* Do not pass fw_reset here: note_fw_reset() would rebase again
 		 * after OPEN may already have published a boot TLV. */
-		esp_schedule_recovery(adapter, delay, false, false);
+		mod_delayed_work(system_wq, &adapter->fw_recovery_work,
+				 msecs_to_jiffies(delay));
 		return;
 	}
 
@@ -372,8 +454,8 @@ static void esp_fw_recovery_work(struct work_struct *work)
 		if (test_bit(ESP_FW_RESET_EXPECTED, &adapter->state_flags)) {
 			spin_unlock_irqrestore(&adapter->fw_recovery_lock, flags);
 			esp_info("Transport recovery: firmware reset still expected, retrying\n");
-			schedule_delayed_work(&adapter->fw_recovery_work,
-					      msecs_to_jiffies(ESP_FW_RECOVERY_QUIET_MS));
+			mod_delayed_work(system_wq, &adapter->fw_recovery_work,
+				 msecs_to_jiffies(ESP_FW_RECOVERY_QUIET_MS));
 			return;
 		}
 		clear_bit(ESP_FW_RECOVERY_PENDING, &adapter->state_flags);
@@ -390,8 +472,8 @@ static void esp_fw_recovery_work(struct work_struct *work)
 	    !test_bit(ESP_TRANSPORT_REMOVING, &adapter->state_flags) &&
 	    (test_bit(ESP_FW_RESET_EXPECTED, &adapter->state_flags) ||
 	     !test_bit(ESP_INIT_DONE, &adapter->state_flags)))
-		schedule_delayed_work(&adapter->fw_recovery_work,
-				      msecs_to_jiffies(ESP_FW_RECOVERY_WATCHDOG_MS));
+		mod_delayed_work(system_wq, &adapter->fw_recovery_work,
+				 msecs_to_jiffies(ESP_FW_RECOVERY_WATCHDOG_MS));
 }
 
 static int process_tx_packet(struct sk_buff *skb)
@@ -609,11 +691,15 @@ static void esp_radio_service_work(struct work_struct *work)
 	struct esp_adapter *adapter =
 		container_of(work, struct esp_adapter, radio_service_work);
 	u8 desired;
+	u8 effective;
+	u8 supported;
 	u8 active;
 	u8 latest;
 	int ret;
+	bool published;
 
 again:
+	published = false;
 	if (!test_bit(ESP_INIT_DONE, &adapter->state_flags) ||
 	    test_bit(ESP_CLEANUP_IN_PROGRESS, &adapter->state_flags) ||
 	    test_bit(ESP_FW_RECOVERY_PENDING, &adapter->state_flags) ||
@@ -633,21 +719,39 @@ again:
 		return;
 	}
 
-	if ((desired & ESP_RADIO_SERVICE_BT) &&
-	    !esp_bt_service_supported(adapter)) {
-		esp_err("Bluetooth service requested but firmware does not advertise HCI support\n");
-		goto check_latest;
-	}
-	if ((desired & ESP_RADIO_SERVICE_IEEE802154) &&
-	    !(adapter->ext_capabilities & ESP_EXT_CAP_RCP_AVAILABLE)) {
-		esp_err("802.15.4 service requested but firmware does not advertise RCP support\n");
-		goto check_latest;
-	}
+	/* Optional secondary radios are independent. Apply every requested
+	 * service that this firmware actually advertises instead of rejecting
+	 * the whole mask when only one member is unavailable. */
+	supported = ESP_RADIO_SERVICE_NONE;
+	if (esp_bt_service_supported(adapter))
+		supported |= ESP_RADIO_SERVICE_BT;
+	if (adapter->ext_capabilities & ESP_EXT_CAP_RCP_AVAILABLE)
+		supported |= ESP_RADIO_SERVICE_IEEE802154;
+	effective = desired & supported;
 
-	ret = cmd_set_radio_service(adapter, desired);
+	if ((desired & ESP_RADIO_SERVICE_BT) &&
+	    !(effective & ESP_RADIO_SERVICE_BT))
+		esp_err("Bluetooth requested but firmware has no HCI; continuing without BT\n");
+	if ((desired & ESP_RADIO_SERVICE_IEEE802154) &&
+	    !(effective & ESP_RADIO_SERVICE_IEEE802154))
+		esp_err("802.15.4 requested but firmware has no RCP; continuing without 802.15.4\n");
+	if (effective != desired)
+		esp_info("Radio request %s reduced to supported subset %s\n",
+			 esp_radio_service_name(desired),
+			 esp_radio_service_name(effective));
+
+	ret = cmd_set_radio_service(adapter, effective);
 	if (ret) {
 		esp_err("Failed to select radio services %s: %d\n",
-			esp_radio_service_name(desired), ret);
+			esp_radio_service_name(effective), ret);
+		/* Initial radio publication belongs to this boot's recovery.
+		 * Bound retries for service command failure rather than silently
+		 * terminating a still-pending boot publication. */
+		if (test_bit(ESP_FW_RADIO_INIT_PENDING, &adapter->state_flags)) {
+			esp_schedule_fw_reset_recovery(adapter);
+			esp_request_firmware_restart(adapter);
+			return;
+		}
 		goto check_latest;
 	}
 
@@ -655,7 +759,7 @@ again:
 	    ESP_RADIO_SERVICE_F_RESTART_REQUIRED) {
 		esp_info("Radio service change %s -> %s requires firmware reincarnation\n",
 			esp_radio_service_name(adapter->radio_service_active),
-			esp_radio_service_name(desired));
+			esp_radio_service_name(effective));
 
 		/*
 		 * A requested removal crossed a backend lifetime boundary. Publish
@@ -707,6 +811,9 @@ again:
 		esp_deinit_rcp(adapter);
 		adapter->rcp_session_nonce = 0;
 	}
+	/* Radio command succeeded and both requested host endpoints now
+	 * exist (or have been intentionally removed). No reboot is pending. */
+	published = true;
 
 check_latest:
 	/*
@@ -719,6 +826,14 @@ check_latest:
 	mutex_unlock(&radio_service_lock);
 	if (latest != desired)
 		goto again;
+	/* A boot-time radio outcome is settled either by successful secondary
+	 * publication or by explicit rejection of an unsupported optional
+	 * service. Both keep the already-published WLAN usable and may release
+	 * its reset budget. Actual service command/endpoint failures and
+	 * restart-required transitions do not reach this point. */
+	if (published &&
+	    test_and_clear_bit(ESP_FW_RADIO_INIT_PENDING, &adapter->state_flags))
+		esp_finish_reconstruction(adapter);
 }
 
 static int check_esp_version(struct fw_version *ver)
@@ -830,9 +945,32 @@ static void esp_commit_reconstruction(struct esp_adapter *adapter)
 
 	if (need_recovery) {
 		esp_info("Transport recovery: request arrived during reconstruction\n");
-		schedule_delayed_work(&adapter->fw_recovery_work,
-				      msecs_to_jiffies(ESP_FW_RECOVERY_QUIET_MS));
+		mod_delayed_work(system_wq, &adapter->fw_recovery_work,
+				 msecs_to_jiffies(ESP_FW_RECOVERY_QUIET_MS));
 	}
+}
+
+/* Do not commit the reboot budget on a syntactically correct boot TLV:
+ * wlan and secondary endpoints can still fail after INIT_DONE is set. */
+static void esp_finish_reconstruction(struct esp_adapter *adapter)
+{
+	unsigned long flags;
+	bool success;
+
+	spin_lock_irqsave(&adapter->fw_recovery_lock, flags);
+	success = test_bit(ESP_INIT_DONE, &adapter->state_flags) &&
+		  !test_bit(ESP_FW_RECOVERY_PENDING, &adapter->state_flags) &&
+		  !test_bit(ESP_FW_RESET_EXPECTED, &adapter->state_flags);
+	if (success) {
+		adapter->fw_boot_reset_attempts = 0;
+		adapter->fw_boot_deadline = 0;
+		/* An eventually successful late boot may heal a terminal timeout. */
+		clear_bit(ESP_FW_RECOVERY_EXHAUSTED, &adapter->state_flags);
+		atomic_inc(&adapter->fw_boot_commit_epoch);
+	}
+	spin_unlock_irqrestore(&adapter->fw_recovery_lock, flags);
+	if (success && adapter->if_ops && adapter->if_ops->commit_fw_recovery)
+		adapter->if_ops->commit_fw_recovery(adapter);
 }
 
 static int process_event_esp_bootup(struct esp_adapter *adapter, u8 *evt_buf, u8 len)
@@ -870,6 +1008,8 @@ static int process_event_esp_bootup(struct esp_adapter *adapter, u8 *evt_buf, u8
 		set_bit(ESP_FW_RECOVERY_PENDING, &adapter->state_flags);
 	clear_bit(ESP_INIT_DONE, &adapter->state_flags);
 	clear_bit(ESP_FW_RESTART_NEEDED, &adapter->state_flags);
+	/* New boot invalidates the pending radio work from the prior image. */
+	clear_bit(ESP_FW_RADIO_INIT_PENDING, &adapter->state_flags);
 	/* Boot metadata belongs to exactly one firmware incarnation. Never let a
 	 * missing/malformed TLV inherit transport/checksum/chip state from the
 	 * previous boot. */
@@ -1026,7 +1166,9 @@ static int process_event_esp_bootup(struct esp_adapter *adapter, u8 *evt_buf, u8
 				ret = -EPROTO;
 				goto fail;
 			}
-			if (tag_len != 1) {
+			if (tag_len != 1 || !*(pos + 2)) {
+				esp_err("Invalid SPI clock TLV value/length value=%u len=%d\n",
+					tag_len ? *(pos + 2) : 0, tag_len);
 				ret = -EINVAL;
 				goto fail;
 			}
@@ -1089,6 +1231,16 @@ static int process_event_esp_bootup(struct esp_adapter *adapter, u8 *evt_buf, u8
 		esp_err("Firmware boot event did not provide a supported chipset ID\n");
 		ret = -EPROTO;
 		goto fail;
+	}
+
+	/* Older compatible SPI firmware may omit the optional clock TLV. Recovery
+	 * deliberately receives BOOT at 1 MHz; only after transport/chip validation
+	 * restore the historical configured startup rate (or 10 MHz default) so an
+	 * omitted TLV cannot pin the accepted session at the bootstrap rate. */
+	if (adapter->if_type == ESP_IF_TYPE_SPI && !seen_spi_clk) {
+		ret = esp_adjust_spi_clock(adapter, 0);
+		if (ret)
+			goto fail;
 	}
 
 	if (seen_rcp_nonce && !(adapter->ext_capabilities & ESP_EXT_CAP_RCP)) {
@@ -1177,6 +1329,10 @@ static int process_event_esp_bootup(struct esp_adapter *adapter, u8 *evt_buf, u8
 	print_ext_capabilities(adapter->ext_capabilities);
 
 	if (adapter->ext_capabilities & ESP_EXT_CAP_RADIO_SERVICE_CTRL) {
+		/* Network publish alone is not the end of reconstruction. Hold the
+		 * reset budget until radio_service_work actually instantiates the
+		 * configured BT/RCP endpoints, with no pending service reboot. */
+		set_bit(ESP_FW_RADIO_INIT_PENDING, &adapter->state_flags);
 		schedule_work(&adapter->radio_service_work);
 	} else {
 		/* Backward compatibility with firmware predating runtime selection. */
@@ -1192,6 +1348,7 @@ static int process_event_esp_bootup(struct esp_adapter *adapter, u8 *evt_buf, u8
 			esp_err("Legacy Bluetooth init failed: %d\n", ret);
 			goto fail_after_commit;
 		}
+		esp_finish_reconstruction(adapter);
 	}
 	return 0;
 
@@ -2151,6 +2308,7 @@ static struct esp_adapter *init_adapter(void)
 	INIT_DELAYED_WORK(&adapter.fw_recovery_work, esp_fw_recovery_work);
 	spin_lock_init(&adapter.fw_recovery_lock);
 	adapter.fw_recovery_backoff_ms = ESP_FW_RECOVERY_QUIET_MS;
+	atomic_set(&adapter.fw_boot_commit_epoch, 0);
 
 	adapter.if_rx_workqueue = alloc_workqueue("ESP_IF_RX_WORK_QUEUE", WQ_HIGHPRI, 0);
 	if (!adapter.if_rx_workqueue) {

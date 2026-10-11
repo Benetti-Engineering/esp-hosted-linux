@@ -312,6 +312,22 @@ fail:
 static void sdio_process_host_bits(uint32_t bits)
 {
     if (bits & (1u << ESP_CLOSE_DATA_PATH)) {
+        /* A host without DT-controlled EN uses CLOSE as its reboot
+         * command. Acknowledge the exact generation through the
+         * RESET_DONE scratch register before restarting. This is a
+         * control-plane ACK, not proof that a reboot has completed:
+         * Linux must still observe the next firmware boot event. */
+        uint8_t gen = sdio_slave_read_reg(0);
+        esp_err_t ack = sdio_slave_write_reg(1, gen);
+
+        if (ack != ESP_OK)
+            ESP_LOGE(TAG, "CLOSE_DATA_PATH reboot ACK failed gen=%u err=0x%x",
+                     gen, ack);
+        else
+            ESP_LOGI(TAG, "CLOSE_DATA_PATH reboot ACK published gen=%u", gen);
+        /* Allow MMC host time to read ACK before firmware reinitializes
+         * the SDIO peripheral. Legacy hosts (no generation) still reboot. */
+        vTaskDelay(pdMS_TO_TICKS(150));
         if (context.event_handler)
             context.event_handler(ESP_CLOSE_DATA_PATH);
     }

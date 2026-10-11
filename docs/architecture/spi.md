@@ -24,9 +24,9 @@ The SPI host driver binds to an `espressif,esp32-spi` Device Tree node rather th
 - `reg`: SPI chip-select index on the controller
 - `spi-max-frequency`: controller and board safety maximum frequency (e.g. 30 MHz)
 - `spi-cpol`: standard Device Tree property selecting SPI mode 2 (CPOL=1, CPHA=0)
-- `reset-gpios`: GPIO descriptor for ESP reset/enable (active-low)
-- `handshake-gpios`: GPIO descriptor for Handshake interrupt input (active-high)
-- `data-ready-gpios`: GPIO descriptor for Data Ready interrupt input (active-high)
+- `reset-gpios`: optional GPIO descriptor for ESP reset/enable (active-low); preferred when the board exposes EN/reset
+- `handshake-gpios`: required GPIO descriptor for Handshake interrupt input (active-high)
+- `data-ready-gpios`: required GPIO descriptor for Data Ready interrupt input (active-high)
 
 Example Device Tree snippet:
 
@@ -46,13 +46,13 @@ Example Device Tree snippet:
 };
 ```
 
-The driver queries these pins via the standard Linux GPIO descriptor API (`devm_gpiod_get()`) and requests edge-triggered interrupts for Handshake and Data Ready based on the descriptor polarities.
+The driver queries these pins via the standard Linux GPIO descriptor API and requests edge-triggered interrupts for Handshake and Data Ready based on the descriptor polarities. When `reset-gpios` is present, recovery can perform an authoritative physical ESP reset. When it is absent, matching firmware uses the sequence-ACKed `CMD_HOST_REBOOT` control transaction; the host accepts that reboot only after the ACK has crossed the SPI wire.
 
 ## Transfer size, mode, and clock
 
 Host-side framing uses `SPI_BUF_SIZE = 1600` bytes and SPI mode 2. Hosted frames include the 12-byte common header plus any alignment padding.
 
-Linux starts SPI at 10 MHz so the boot exchange can begin. Firmware includes its target SPI clock in boot information, and the host can reconfigure the SPI device after receiving that value. The final clock therefore depends on the ESP target and host-controller limits.
+Linux clocks the boot-first/recovery exchange at a conservative 1 MHz. After a valid boot event, firmware's optional clock TLV selects the steady-state SPI rate subject to the Device Tree/protocol maximum. Compatible older firmware that omits the TLV falls back to the configured `clockspeed` value or the historical 10 MHz default.
 
 ## Transfer sequence
 
