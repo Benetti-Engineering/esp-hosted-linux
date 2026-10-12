@@ -572,7 +572,7 @@ void esp_cfg80211_monitor_rx(struct esp_adapter *adapter, struct sk_buff *skb)
 		return;
 	}
 
-	frame_len = le16_to_cpu(meta.frame_len);
+	frame_len = esp_wire_le16_to_cpu(meta.frame_len);
 	if (!frame_len || frame_len > skb->len - sizeof(meta) || !meta.channel) {
 		adapter->monitor_rx_malformed++;
 		mon->ndev->stats.rx_errors++;
@@ -773,6 +773,17 @@ static int esp_cfg80211_set_monitor_channel(struct wiphy *wiphy,
 	return 0;
 }
 
+/* Newer cfg80211 versions supply the requesting netdev as well. Monitor
+ * channel configuration remains wiphy-scoped: Hosted supports one monitor
+ * interface per radio and uses the same policy for both callback forms. */
+static int esp_cfg80211_set_monitor_channel_with_dev(struct wiphy *wiphy,
+					    struct net_device *dev,
+					    struct cfg80211_chan_def *chandef)
+{
+	(void)dev;
+	return esp_cfg80211_set_monitor_channel(wiphy, chandef);
+}
+
 void esp_cfg80211_detach_monitor(struct esp_adapter *adapter)
 {
 	struct esp_monitor_device *mon;
@@ -911,6 +922,19 @@ static struct wireless_dev *esp_cfg80211_add_virtual_iface(struct wiphy *wiphy,
 		return ERR_PTR(-EOPNOTSUPP);
 
 	return esp_cfg80211_add_monitor_iface(wiphy, name, name_assign_type);
+}
+
+/* Pre-4.12 cfg80211 supplies a separate monitor-flags argument. The
+ * common implementation already handles all supported monitor creation
+ * requests; retain its behavior for these older kernels. */
+static struct wireless_dev *esp_cfg80211_add_virtual_iface_with_flags(
+		struct wiphy *wiphy, const char *name,
+		unsigned char name_assign_type, enum nl80211_iftype type,
+		u32 *flags, struct vif_params *params)
+{
+	(void)flags;
+	return esp_cfg80211_add_virtual_iface(wiphy, name, name_assign_type,
+					     type, params);
 }
 
 struct wireless_dev *esp_cfg80211_add_iface(struct wiphy *wiphy,
@@ -2520,10 +2544,28 @@ static int esp_cfg80211_change_station(struct wiphy *wiphy,
 	return 0;
 }
 
+/*
+ * Match the actual cfg80211_ops prototypes from the headers being compiled,
+ * not just LINUX_VERSION_CODE: distribution and stable trees can backport
+ * signature changes (e.g. set_monitor_channel's netdev argument to 6.12).
+ * Both GCC and Clang resolve this at compile time; an unknown prototype
+ * still triggers a type error rather than an unsafe function-pointer cast.
+ */
+#define ESP_CFG80211_SELECT_OP(field, modern, legacy) \
+	__builtin_choose_expr( \
+		__builtin_types_compatible_p( \
+			__typeof__(((struct cfg80211_ops *)0)->field), \
+			__typeof__(&(modern))), \
+		modern, legacy)
+
 static struct cfg80211_ops esp_cfg80211_ops = {
-	.add_virtual_intf = esp_cfg80211_add_virtual_iface,
+	.add_virtual_intf = ESP_CFG80211_SELECT_OP(add_virtual_intf,
+					  esp_cfg80211_add_virtual_iface,
+					  esp_cfg80211_add_virtual_iface_with_flags),
 	.del_virtual_intf = esp_cfg80211_del_iface,
-	.set_monitor_channel = esp_cfg80211_set_monitor_channel,
+	.set_monitor_channel = ESP_CFG80211_SELECT_OP(set_monitor_channel,
+					  esp_cfg80211_set_monitor_channel_with_dev,
+					  esp_cfg80211_set_monitor_channel),
 	.change_virtual_intf = esp_cfg80211_change_iface,
 	.scan = esp_cfg80211_scan,
 	/*.connect = esp_cfg80211_connect,*/

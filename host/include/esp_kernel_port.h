@@ -272,9 +272,9 @@ static inline void timer_setup(struct timer_list *timer,
 #define NETIF_RX_NI(skb)	netif_rx_ni(skb)
 #endif
 
-/* wireless_dev.mtx was removed in 6.12. cfg80211 holds the wiphy mutex
- * across MLME ops, so later notifications must use the same lock. */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+/* wireless_dev.mtx was removed in Linux 6.7. Use the wiphy mutex
+ * for cfg80211 MLME notifications from 6.7 onward. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 7, 0)
 static inline void esp_wdev_lock(struct wireless_dev *wdev)
 {
 	wiphy_lock(wdev->wiphy);
