@@ -62,6 +62,7 @@ int process_set_ap_config(uint8_t if_type, uint8_t *payload, uint16_t payload_le
 int process_mgmt_tx(uint8_t if_type, uint8_t *payload, uint16_t payload_len);
 int process_ap_station(uint8_t if_type, uint8_t *payload, uint16_t payload_len);
 int process_rssi(uint8_t if_type, uint8_t *payload, uint16_t payload_len);
+int process_monitor_config(uint8_t if_type, uint8_t *payload, uint16_t payload_len);
 int process_ota_start(uint8_t if_type, uint8_t *payload, uint16_t payload_len);
 int process_ota_write(uint8_t if_type, uint8_t *payload, uint16_t payload_len);
 int process_ota_end(uint8_t if_type, uint8_t *payload, uint16_t payload_len);

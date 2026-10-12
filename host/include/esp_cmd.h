@@ -33,6 +33,7 @@ void esp_deliver_disconnect_from_skb(struct esp_wifi_device *priv,
 int esp_cfg_cleanup(struct esp_adapter *adapter);
 int cmd_init_interface(struct esp_wifi_device *priv);
 int cmd_deinit_interface(struct esp_wifi_device *priv);
+int cmd_monitor_config(struct esp_adapter *adapter, bool enable, u8 channel);
 int process_cmd_resp(struct esp_adapter *adapter, struct sk_buff *skb);
 void esp_cmd_transport_failed(struct esp_adapter *adapter, uint8_t cmd_code,
 		uint16_t cmd_seq, int error);

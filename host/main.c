@@ -1272,6 +1272,23 @@ static int process_event_esp_bootup(struct esp_adapter *adapter, u8 *evt_buf, u8
 	esp_begin_reconstruction(adapter);
 	atomic_set(&adapter->state, ESP_CONTEXT_READY);
 
+	/*
+	 * Registered cfg80211 interface types cannot be changed in place.
+	 * If upgraded/downgraded firmware changes monitor support, the previous
+	 * PHY's advertised iftypes become stale. All WLAN netdevs have already
+	 * been removed by esp_remove_card() during reconstruction, so replace
+	 * the old registered wiphy before publishing the new WLAN interfaces.
+	 * Unchanged capabilities keep the existing in-place monitor fast path.
+	 */
+	if (adapter->wiphy &&
+	    !!(adapter->wiphy->interface_modes & BIT(NL80211_IFTYPE_MONITOR)) !=
+	    !!(adapter->capabilities & ESP_WLAN_MONITOR_SUPPORT)) {
+		esp_warn("Monitor support changed across firmware restart; recreating wiphy\n");
+		ret = esp_remove_wiphy(adapter);
+		if (ret)
+			goto fail;
+	}
+
 	ret = esp_add_card(adapter);
 	if (ret) {
 		esp_err("network interface init failed\n");
@@ -1318,6 +1335,12 @@ static int process_event_esp_bootup(struct esp_adapter *adapter, u8 *evt_buf, u8
 	ret = esp_publish_network_ifaces(adapter);
 	if (ret) {
 		esp_err("network interface publish failed\n");
+		goto fail_after_commit;
+	}
+
+	ret = esp_cfg80211_restore_monitor(adapter);
+	if (ret) {
+		esp_err("monitor interface restore failed: %d\n", ret);
 		goto fail_after_commit;
 	}
 
@@ -1392,7 +1415,14 @@ static int esp_stop(struct net_device *ndev)
 	esp_port_close(priv);
 	priv->stop_data = 1;
 	if (test_bit(ESP_INTERFACE_INITIALIZED, &priv->priv_flags)) {
-		if (!test_bit(ESP_SKIP_FW_DEINIT, &priv->adapter->state_flags)) {
+		/* Firmware DEINIT removes the STA/AP role even when mon0 is active.
+		 * The firmware restarts Wi-Fi in monitor-only mode and restores
+		 * capture without tearing down the monitor netdev. */
+		/* Do not issue stale firmware control commands after transport
+		 * removal or module unload has begun. */
+		if (!test_bit(ESP_SKIP_FW_DEINIT, &priv->adapter->state_flags) &&
+		    !test_bit(ESP_TRANSPORT_REMOVING, &priv->adapter->state_flags) &&
+		    !test_bit(ESP_DRIVER_UNLOADING, &priv->adapter->state_flags)) {
 			esp_info("Deinitializing interface %s on ESP side\n", ndev->name);
 			if (cmd_deinit_interface(priv) != 0) {
 				esp_err("Failed to deinit interface");
@@ -1613,18 +1643,24 @@ int esp_init_raw_tp(struct esp_adapter *adapter)
 
 int esp_add_card(struct esp_adapter *adapter)
 {
+	bool reuse_wiphy;
 	int ret;
 
 	if (!adapter)
 		return -EINVAL;
 
+	/* A firmware-only restart may retain the wiphy and an existing user
+	 * monitor interface. Never register a second wiphy for that binding. */
+	reuse_wiphy = !!adapter->wiphy;
 	ret = esp_commands_setup(adapter);
 	if (ret)
 		return ret;
 
-	ret = esp_add_wiphy(adapter);
-	if (ret)
-		goto rollback_commands;
+	if (!reuse_wiphy) {
+		ret = esp_add_wiphy(adapter);
+		if (ret)
+			goto rollback_commands;
+	}
 
 	ret = esp_add_network_ifaces(adapter);
 	if (ret)
@@ -1634,7 +1670,8 @@ int esp_add_card(struct esp_adapter *adapter)
 	return 0;
 
 rollback_wiphy:
-	esp_remove_wiphy(adapter);
+	if (!reuse_wiphy)
+		esp_remove_wiphy(adapter);
 rollback_commands:
 	esp_commands_teardown(adapter);
 	return ret;
@@ -1726,8 +1763,19 @@ static int esp_stop_network_ifaces(struct esp_adapter *adapter)
 
 int esp_remove_card(struct esp_adapter *adapter, bool notify_fw)
 {
+	bool preserve_monitor_wiphy;
+
 	if (!adapter)
 		return 0;
+
+	/* A firmware reboot on the SAME bound transport must not remove the
+	 * userspace-created monitor VIF. Keep its wiphy/netdev registered, but
+	 * stop capture while commands and WLAN interfaces are rebuilt. Physical
+	 * transport removal and driver unload always destroy the whole wiphy. */
+	preserve_monitor_wiphy = !notify_fw && adapter->wiphy &&
+		adapter->monitor && adapter->monitor_present &&
+		!test_bit(ESP_TRANSPORT_REMOVING, &adapter->state_flags) &&
+		!test_bit(ESP_DRIVER_UNLOADING, &adapter->state_flags);
 
 	esp_cmd_abort_waiters(adapter);
 	cancel_work_sync(&adapter->radio_service_work);
@@ -1747,7 +1795,11 @@ int esp_remove_card(struct esp_adapter *adapter, bool notify_fw)
 	esp_deinit_bt(adapter);
 	esp_commands_teardown(adapter);
 	esp_remove_network_ifaces(adapter);
-	esp_remove_wiphy(adapter);
+	if (preserve_monitor_wiphy) {
+		esp_info("MONITOR_VIF_INPLACE_PRESERVED across firmware restart\n");
+	} else {
+		esp_remove_wiphy(adapter);
+	}
 	return 0;
 }
 
@@ -2067,6 +2119,16 @@ static void process_rx_packet(struct esp_adapter *adapter, struct sk_buff *skb)
 		if (skb->len > len)
 			skb_trim(skb, len);
 		esp_rcp_rx(adapter, skb);
+	} else if (payload_header->if_type == ESP_MONITOR_IF) {
+		if (skb->len > len)
+			skb_trim(skb, len);
+		if (payload_header->packet_type == PACKET_TYPE_COMMAND_RESPONSE) {
+			process_cmd_resp(adapter, skb);
+		} else if (payload_header->packet_type == PACKET_TYPE_MONITOR) {
+			esp_cfg80211_monitor_rx(adapter, skb);
+		} else {
+			dev_kfree_skb_any(skb);
+		}
 	} else if (payload_header->if_type == ESP_HCI_IF) {
 		u8 pkt_type;
 		u16 payload_len;
