@@ -13,6 +13,8 @@
 #include "esp_cmd.h"
 #include "esp_kernel_port.h"
 #include "esp_utils.h"
+#include <net/ieee80211_radiotap.h>
+#include <linux/if_arp.h>
 
 #ifndef U16_MAX
 #define U16_MAX			((u16)~0U)
@@ -260,6 +262,681 @@ static int esp_inetaddr_event(struct notifier_block *nb,
 	return 0;
 }
 
+
+static netdev_tx_t esp_monitor_xmit(struct sk_buff *skb, struct net_device *ndev)
+{
+	ndev->stats.tx_dropped++;
+	dev_kfree_skb_any(skb);
+	return NETDEV_TX_OK;
+}
+
+static int esp_monitor_open(struct net_device *ndev)
+{
+	struct esp_monitor_device *mon = netdev_priv(ndev);
+	struct esp_adapter *adapter;
+	struct esp_wifi_device *control_priv;
+	bool started_radio = false;
+	int ret;
+
+	if (!mon || !mon->adapter)
+		return -ENODEV;
+	adapter = mon->adapter;
+
+	if (test_bit(ESP_CLEANUP_IN_PROGRESS, &adapter->state_flags) ||
+	    test_bit(ESP_DRIVER_UNLOADING, &adapter->state_flags) ||
+	    test_bit(ESP_TRANSPORT_REMOVING, &adapter->state_flags))
+		return -EBUSY;
+
+	/*
+	 * Monitor-only operation still needs the shared physical Wi-Fi radio
+	 * started.  Reuse the existing STA control context for radio lifetime,
+	 * but monitor commands themselves stay explicitly addressed to
+	 * ESP_MONITOR_IF on the wire.
+	 */
+	control_priv = adapter->priv[ESP_STA_NW_IF];
+	if (!control_priv)
+		return -ENODEV;
+	if (!test_bit(ESP_INTERFACE_INITIALIZED, &control_priv->priv_flags)) {
+		ret = cmd_init_interface(control_priv);
+		if (ret)
+			return ret;
+		set_bit(ESP_INTERFACE_INITIALIZED, &control_priv->priv_flags);
+		started_radio = true;
+	}
+
+	ret = cmd_monitor_config(adapter, true, adapter->monitor_channel);
+	if (ret) {
+		if (started_radio) {
+			cmd_deinit_interface(control_priv);
+			clear_bit(ESP_INTERFACE_INITIALIZED,
+				  &control_priv->priv_flags);
+		}
+		return ret;
+	}
+
+	adapter->monitor_up = true;
+	netif_carrier_on(ndev);
+	return 0;
+}
+
+/* WLAN roles share one radio with monitor capture. Inspect all exposed
+ * WLAN slots, not only the STA control netdev borrowed for monitor-only
+ * startup. A running WLAN netdev is a separate active radio user. */
+static bool esp_monitor_has_active_wlan_user(struct esp_adapter *adapter)
+{
+	struct esp_wifi_device *priv;
+	int i;
+
+	for (i = 0; i < ESP_MAX_INTERFACE; i++) {
+		priv = adapter->priv[i];
+		if (priv && priv->ndev &&
+		    (priv->if_type == ESP_STA_IF || priv->if_type == ESP_AP_IF) &&
+		    netif_running(priv->ndev))
+			return true;
+	}
+	return false;
+}
+
+static int esp_monitor_stop(struct net_device *ndev)
+{
+	struct esp_monitor_device *mon = netdev_priv(ndev);
+	struct esp_adapter *adapter;
+	struct esp_wifi_device *control_priv;
+	bool preserve;
+	int ret;
+
+	if (!mon || !mon->adapter)
+		return 0;
+	adapter = mon->adapter;
+	/* Retain monitor intent during in-place firmware reconstruction. On a
+	 * physical unbind, detach_monitor() will clear the saved interface; no
+	 * stale DEINIT command may be sent on a removing transport. */
+	preserve = test_bit(ESP_SKIP_FW_DEINIT, &adapter->state_flags) ||
+		   test_bit(ESP_TRANSPORT_REMOVING, &adapter->state_flags) ||
+		   test_bit(ESP_DRIVER_UNLOADING, &adapter->state_flags) ||
+		   !(adapter->capabilities & ESP_WLAN_MONITOR_SUPPORT);
+
+	netif_carrier_off(ndev);
+	if (preserve)
+		return 0;
+
+	if (adapter->monitor_up &&
+	    !test_bit(ESP_TRANSPORT_REMOVING, &adapter->state_flags)) {
+		ret = cmd_monitor_config(adapter, false,
+					 adapter->monitor_channel ?
+					 adapter->monitor_channel : 1);
+		if (ret) {
+			/* The netdev is down but firmware promiscuous state is
+			 * uncertain; restart through the existing bounded recovery
+			 * path. Do not send further WLAN commands to this image. */
+			adapter->monitor_up = false;
+			esp_err("Monitor disable unconfirmed (%d); requesting firmware restart\n", ret);
+			esp_schedule_fw_reset_recovery(adapter);
+			esp_request_firmware_restart(adapter);
+			return 0;
+		}
+	}
+	adapter->monitor_up = false;
+
+	/*
+	 * If wlan0 was closed while monitor mode kept the firmware Wi-Fi
+	 * engine alive, stop it now that the last radio user is gone.
+	 */
+	control_priv = adapter->priv[ESP_STA_NW_IF];
+	if (!esp_monitor_has_active_wlan_user(adapter) && control_priv &&
+	    !test_bit(ESP_DRIVER_UNLOADING, &adapter->state_flags)) {
+		/* Also handles wlan0 closed while monitor kept the radio alive:
+		 * ESP_INTERFACE_INITIALIZED is not a reliable user count. */
+		ret = cmd_deinit_interface(control_priv);
+		if (ret)
+			esp_warn("Failed to stop monitor-only Wi-Fi radio: %d\n",
+				 ret);
+		else
+			clear_bit(ESP_INTERFACE_INITIALIZED,
+				  &control_priv->priv_flags);
+	}
+
+	return 0;
+}
+
+static const struct net_device_ops esp_monitor_netdev_ops = {
+	.ndo_open = esp_monitor_open,
+	.ndo_stop = esp_monitor_stop,
+	.ndo_start_xmit = esp_monitor_xmit,
+};
+
+static void esp_monitor_setup(struct net_device *ndev)
+{
+	/*
+	 * Follow the kernel monitor-netdev convention: initialize the common
+	 * net_device fields with ether_setup(), then expose radiotap at the
+	 * link layer.  This avoids leaving generic netdev state uninitialized.
+	 */
+	ether_setup(ndev);
+	ndev->type = ARPHRD_IEEE80211_RADIOTAP;
+	ndev->mtu = 2304;
+	ndev->tx_queue_len = 0;
+	ndev->priv_flags |= IFF_NO_QUEUE;
+	ndev->netdev_ops = &esp_monitor_netdev_ops;
+}
+
+static u8 esp_monitor_legacy_rate(u8 rate)
+{
+	switch (rate) {
+	case WIFI_PHY_RATE_1M_L:
+		return 2;
+	case WIFI_PHY_RATE_2M_L:
+	case WIFI_PHY_RATE_2M_S:
+		return 4;
+	case WIFI_PHY_RATE_5M_L:
+	case WIFI_PHY_RATE_5M_S:
+		return 11;
+	case WIFI_PHY_RATE_11M_L:
+	case WIFI_PHY_RATE_11M_S:
+		return 22;
+	case WIFI_PHY_RATE_6M:
+		return 12;
+	case WIFI_PHY_RATE_9M:
+		return 18;
+	case WIFI_PHY_RATE_12M:
+		return 24;
+	case WIFI_PHY_RATE_18M:
+		return 36;
+	case WIFI_PHY_RATE_24M:
+		return 48;
+	case WIFI_PHY_RATE_36M:
+		return 72;
+	case WIFI_PHY_RATE_48M:
+		return 96;
+	case WIFI_PHY_RATE_54M:
+		return 108;
+	default:
+		return 0;
+	}
+}
+
+static size_t esp_monitor_radiotap(const struct esp_monitor_meta_v1 *meta,
+				   u8 *buf, size_t buf_len)
+{
+	struct ieee80211_radiotap_header *hdr;
+	u32 present = BIT(IEEE80211_RADIOTAP_FLAGS) |
+		      BIT(IEEE80211_RADIOTAP_CHANNEL) |
+		      BIT(IEEE80211_RADIOTAP_DBM_ANTSIGNAL);
+	u16 freq;
+	u16 chan_flags;
+	u8 legacy_rate = 0;
+	size_t off = sizeof(*hdr);
+	__le16 le16;
+	__le32 le32;
+
+	if (meta->sig_mode == 0)
+		legacy_rate = esp_monitor_legacy_rate(meta->rate);
+	if (legacy_rate)
+		present |= BIT(IEEE80211_RADIOTAP_RATE);
+	if (meta->antenna != 0xff)
+		present |= BIT(IEEE80211_RADIOTAP_ANTENNA);
+	if (meta->sig_mode == 1 && meta->mcs != 0xff)
+		present |= BIT(IEEE80211_RADIOTAP_MCS);
+
+	if (buf_len < 32)
+		return 0;
+	memset(buf, 0, buf_len);
+	hdr = (struct ieee80211_radiotap_header *)buf;
+	hdr->it_version = 0;
+	le32 = cpu_to_le32(present);
+	memcpy(&hdr->it_present, &le32, sizeof(le32));
+
+	/* FLAGS */
+	buf[off++] = ((meta->flags & ESP_MONITOR_FLAG_FCS_PRESENT) ?
+		      IEEE80211_RADIOTAP_F_FCS : 0) |
+		     ((meta->flags & ESP_MONITOR_FLAG_FCS_BAD) ?
+		      IEEE80211_RADIOTAP_F_BADFCS : 0);
+
+	/* RATE */
+	if (legacy_rate)
+		buf[off++] = legacy_rate;
+
+	/* CHANNEL: 16-bit fields require two-byte alignment. */
+	off = ALIGN(off, 2);
+	freq = ieee80211_channel_to_frequency(meta->channel,
+			meta->channel <= 14 ? NL80211_BAND_2GHZ :
+					      NL80211_BAND_5GHZ);
+	chan_flags = meta->channel <= 14 ? IEEE80211_CHAN_2GHZ :
+					      IEEE80211_CHAN_5GHZ;
+	if (meta->flags & ESP_MONITOR_FLAG_CCK)
+		chan_flags |= IEEE80211_CHAN_CCK;
+	else
+		chan_flags |= IEEE80211_CHAN_OFDM;
+	le16 = cpu_to_le16(freq);
+	memcpy(buf + off, &le16, sizeof(le16));
+	off += sizeof(le16);
+	le16 = cpu_to_le16(chan_flags);
+	memcpy(buf + off, &le16, sizeof(le16));
+	off += sizeof(le16);
+
+	/* RSSI */
+	buf[off++] = (u8)meta->rssi;
+
+	/* ANTENNA */
+	if (meta->antenna != 0xff)
+		buf[off++] = meta->antenna;
+
+	/* MCS */
+	if (meta->sig_mode == 1 && meta->mcs != 0xff) {
+		buf[off++] = IEEE80211_RADIOTAP_MCS_HAVE_BW |
+			     IEEE80211_RADIOTAP_MCS_HAVE_MCS |
+			     IEEE80211_RADIOTAP_MCS_HAVE_GI;
+		buf[off++] = (meta->cwb ? IEEE80211_RADIOTAP_MCS_BW_40 : 0) |
+			     ((meta->flags & ESP_MONITOR_FLAG_SHORT_GI) ?
+			      IEEE80211_RADIOTAP_MCS_SGI : 0);
+		buf[off++] = meta->mcs;
+	}
+
+	hdr->it_len = cpu_to_le16(off);
+	return off;
+}
+
+void esp_cfg80211_monitor_rx(struct esp_adapter *adapter, struct sk_buff *skb)
+{
+	struct esp_monitor_meta_v1 meta;
+	struct esp_monitor_device *mon;
+	u16 frame_len;
+	u32 skb_len;
+	int rx_status;
+	u8 radiotap[32];
+	size_t radiotap_len;
+
+	if (!adapter || !skb)
+		goto drop_no_adapter;
+
+	mon = READ_ONCE(adapter->monitor);
+	if (!mon || !mon->ndev || !adapter->monitor_up ||
+	    !netif_running(mon->ndev)) {
+		adapter->monitor_rx_drops++;
+		dev_kfree_skb_any(skb);
+		return;
+	}
+
+	if (skb->len < sizeof(meta)) {
+		adapter->monitor_rx_malformed++;
+		mon->ndev->stats.rx_errors++;
+		dev_kfree_skb_any(skb);
+		return;
+	}
+
+	memcpy(&meta, skb->data, sizeof(meta));
+	if (meta.version != ESP_MONITOR_META_VERSION) {
+		adapter->monitor_rx_malformed++;
+		mon->ndev->stats.rx_errors++;
+		dev_kfree_skb_any(skb);
+		return;
+	}
+
+	frame_len = esp_wire_le16_to_cpu(meta.frame_len);
+	if (!frame_len || frame_len > skb->len - sizeof(meta) || !meta.channel) {
+		adapter->monitor_rx_malformed++;
+		mon->ndev->stats.rx_errors++;
+		dev_kfree_skb_any(skb);
+		return;
+	}
+
+	/* Packet metadata is observational. In-flight frames from the previous
+	 * channel must never change the user's requested restore channel. */
+	WRITE_ONCE(adapter->monitor_rx_channel, meta.channel);
+
+	radiotap_len = esp_monitor_radiotap(&meta, radiotap, sizeof(radiotap));
+	if (!radiotap_len) {
+		adapter->monitor_rx_malformed++;
+		mon->ndev->stats.rx_errors++;
+		dev_kfree_skb_any(skb);
+		return;
+	}
+
+	skb_pull(skb, sizeof(meta));
+	skb_trim(skb, frame_len);
+	if (skb_cow_head(skb, radiotap_len)) {
+		adapter->monitor_rx_drops++;
+		mon->ndev->stats.rx_dropped++;
+		dev_kfree_skb_any(skb);
+		return;
+	}
+	memcpy(skb_push(skb, radiotap_len), radiotap, radiotap_len);
+
+	skb->dev = mon->ndev;
+	skb_reset_mac_header(skb);
+	skb->pkt_type = PACKET_OTHERHOST;
+	skb->protocol = htons(ETH_P_802_2);
+
+	/* netif_rx() consumes skb whether it accepts or drops it. Retain
+	 * lengths locally; only count packets accepted into the host stack. */
+	skb_len = skb->len;
+	adapter->monitor_rx_submitted++;
+	rx_status = netif_rx(skb);
+	if (rx_status == NET_RX_DROP) {
+		adapter->monitor_rx_stack_drops++;
+		adapter->monitor_rx_drops++;
+		mon->ndev->stats.rx_dropped++;
+	} else {
+		adapter->monitor_rx_packets++;
+		adapter->monitor_rx_bytes += frame_len;
+		mon->ndev->stats.rx_packets++;
+		mon->ndev->stats.rx_bytes += skb_len;
+	}
+	return;
+
+drop_no_adapter:
+	if (skb)
+		dev_kfree_skb_any(skb);
+}
+
+static struct wireless_dev *esp_cfg80211_add_monitor_iface(struct wiphy *wiphy,
+		const char *name, unsigned char name_assign_type)
+{
+	struct esp_device *esp_dev = wiphy_priv(wiphy);
+	struct esp_adapter *adapter;
+	struct esp_monitor_device *mon;
+	struct net_device *ndev;
+	int ret;
+
+	if (!esp_dev || !esp_dev->adapter)
+		return ERR_PTR(-ENODEV);
+	adapter = esp_dev->adapter;
+
+	if (!(adapter->capabilities & ESP_WLAN_MONITOR_SUPPORT))
+		return ERR_PTR(-EOPNOTSUPP);
+	if (adapter->monitor)
+		return ERR_PTR(-EBUSY);
+
+	ndev = ALLOC_NETDEV(sizeof(*mon), name, name_assign_type,
+			   esp_monitor_setup);
+	if (!ndev)
+		return ERR_PTR(-ENOMEM);
+
+	mon = netdev_priv(ndev);
+	mon->adapter = adapter;
+	mon->ndev = ndev;
+	mon->wdev.wiphy = wiphy;
+	mon->wdev.netdev = ndev;
+	mon->wdev.iftype = NL80211_IFTYPE_MONITOR;
+	ndev->ieee80211_ptr = &mon->wdev;
+	dev_net_set(ndev, wiphy_net(wiphy));
+	SET_NETDEV_DEV(ndev, wiphy_dev(wiphy));
+	netif_carrier_off(ndev);
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+	/*
+	 * cfg80211 add_virtual_intf callbacks already hold RTNL + the wiphy
+	 * mutex. Use the cfg80211 helper so the NETDEV_REGISTER notifier does
+	 * not try to acquire the same wiphy mutex recursively.
+	 */
+	ret = cfg80211_register_netdevice(ndev);
+#else
+	ret = register_netdevice(ndev);
+#endif
+	if (ret) {
+		dev_net_set(ndev, NULL);
+		free_netdev(ndev);
+		return ERR_PTR(ret);
+	}
+
+	WRITE_ONCE(adapter->monitor, mon);
+	adapter->monitor_present = true;
+	snprintf(adapter->monitor_name, sizeof(adapter->monitor_name), "%s",
+		 ndev->name);
+	return &mon->wdev;
+}
+
+static int esp_cfg80211_del_iface(struct wiphy *wiphy,
+				  struct wireless_dev *wdev)
+{
+	struct esp_device *esp_dev;
+	struct esp_adapter *adapter;
+	struct net_device *ndev;
+
+	if (!wiphy || !wdev || wdev->iftype != NL80211_IFTYPE_MONITOR)
+		return -EOPNOTSUPP;
+
+	esp_dev = wiphy_priv(wiphy);
+	if (!esp_dev || !esp_dev->adapter)
+		return -ENODEV;
+	adapter = esp_dev->adapter;
+	if (!adapter->monitor || &adapter->monitor->wdev != wdev)
+		return -ENOENT;
+
+	ndev = wdev->netdev;
+	adapter->monitor_present = false;
+	adapter->monitor_name[0] = '\0';
+
+	/*
+	 * Stop new RX lookups before unregister can free the monitor netdev.
+	 * ndo_stop uses the monitor private data passed through ndev, so it
+	 * does not require adapter->monitor to remain published.
+	 */
+	WRITE_ONCE(adapter->monitor, NULL);
+	/* process_rx_packet() runs only on if_rx_workqueue. Drain any reader
+	 * that may have fetched the old monitor pointer before unregister can
+	 * release the netdev/private storage. New RX observes NULL and drops. */
+	if (adapter->if_rx_workqueue)
+		flush_workqueue(adapter->if_rx_workqueue);
+
+	/* unregister invokes ndo_stop for an UP monitor interface; keep the
+	 * desired-up bit visible until ndo_stop has disabled firmware capture. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+	if (ndev)
+		ndev->needs_free_netdev = true;
+	cfg80211_unregister_wdev(wdev);
+#else
+	if (ndev && ndev->reg_state == NETREG_REGISTERED)
+		unregister_netdevice(ndev);
+	if (ndev)
+		free_netdev(ndev);
+#endif
+	adapter->monitor_up = false;
+	/* Explicit userspace deletion starts a fresh monitor-channel selection on
+	 * the next VIF. Recovery detach uses esp_cfg80211_detach_monitor() instead
+	 * and intentionally preserves this value. */
+	WRITE_ONCE(adapter->monitor_channel, 0);
+	return 0;
+}
+
+static int esp_cfg80211_set_monitor_channel(struct wiphy *wiphy,
+					     struct cfg80211_chan_def *chandef)
+{
+	struct esp_device *esp_dev;
+	struct esp_adapter *adapter;
+	u8 channel;
+	int ret;
+
+	if (!wiphy || !chandef || !chandef->chan)
+		return -EINVAL;
+	if (chandef->width != NL80211_CHAN_WIDTH_20 &&
+	    chandef->width != NL80211_CHAN_WIDTH_20_NOHT)
+		return -EOPNOTSUPP;
+
+	esp_dev = wiphy_priv(wiphy);
+	if (!esp_dev || !esp_dev->adapter)
+		return -ENODEV;
+	adapter = esp_dev->adapter;
+	if (!adapter->monitor_present)
+		return -ENODEV;
+
+	channel = chandef->chan->hw_value;
+	if (!channel)
+		return -EINVAL;
+
+	if (adapter->monitor_up) {
+		ret = cmd_monitor_config(adapter, true, channel);
+		if (ret)
+			return ret;
+	}
+	adapter->monitor_channel = channel;
+	return 0;
+}
+
+/* Newer cfg80211 versions supply the requesting netdev as well. Monitor
+ * channel configuration remains wiphy-scoped: Hosted supports one monitor
+ * interface per radio and uses the same policy for both callback forms. */
+static int esp_cfg80211_set_monitor_channel_with_dev(struct wiphy *wiphy,
+					    struct net_device *dev,
+					    struct cfg80211_chan_def *chandef)
+{
+	(void)dev;
+	return esp_cfg80211_set_monitor_channel(wiphy, chandef);
+}
+
+void esp_cfg80211_detach_monitor(struct esp_adapter *adapter)
+{
+	struct esp_monitor_device *mon;
+	struct net_device *ndev;
+	bool retire_monitor;
+
+	if (!adapter || !adapter->wiphy)
+		return;
+
+	/* cfg80211 del_virtual_intf owns RTNL and the wiphy mutex; take
+	 * those same locks BEFORE reading a potentially freed monitor. */
+	rtnl_lock();
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+	wiphy_lock(adapter->wiphy);
+#endif
+	retire_monitor = test_bit(ESP_TRANSPORT_REMOVING,
+				   &adapter->state_flags) ||
+			 test_bit(ESP_DRIVER_UNLOADING,
+				   &adapter->state_flags) ||
+			 !(adapter->capabilities & ESP_WLAN_MONITOR_SUPPORT);
+	mon = READ_ONCE(adapter->monitor);
+	if (!mon) {
+		if (retire_monitor) {
+			adapter->monitor_present = false;
+			adapter->monitor_up = false;
+			adapter->monitor_name[0] = '\0';
+			WRITE_ONCE(adapter->monitor_channel, 0);
+		}
+		goto unlock;
+	}
+	ndev = mon->ndev;
+	WRITE_ONCE(adapter->monitor, NULL);
+	/* RX readers are serialized on this workqueue; drain any lookup
+	 * that preceded unpublication before freeing the monitor netdev. */
+	if (adapter->if_rx_workqueue)
+		flush_workqueue(adapter->if_rx_workqueue);
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+	if (ndev)
+		ndev->needs_free_netdev = true;
+	cfg80211_unregister_wdev(&mon->wdev);
+#else
+	if (ndev && ndev->reg_state == NETREG_REGISTERED)
+		unregister_netdevice(ndev);
+	if (ndev)
+		free_netdev(ndev);
+#endif
+	if (retire_monitor) {
+		adapter->monitor_present = false;
+		adapter->monitor_up = false;
+		adapter->monitor_name[0] = '\0';
+		WRITE_ONCE(adapter->monitor_channel, 0);
+		esp_info("MONITOR_VIF_RETIRED: transport removed or firmware capability lost\n");
+	}
+unlock:
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+	wiphy_unlock(adapter->wiphy);
+#endif
+	rtnl_unlock();
+}
+
+int esp_cfg80211_restore_monitor(struct esp_adapter *adapter)
+{
+	struct wireless_dev *wdev = NULL;
+	struct net_device *ndev;
+	bool should_up;
+	int ret = 0;
+
+	if (!adapter)
+		return 0;
+	if (!(adapter->capabilities & ESP_WLAN_MONITOR_SUPPORT) &&
+	    adapter->monitor_present) {
+		/* Monitor is optional. Unregister its preserved netdev and retire
+		 * stale intent, but let STA/AP reconstruction complete normally. */
+		esp_warn("Firmware no longer supports monitor; retiring mon0 without failing WLAN\n");
+		esp_cfg80211_detach_monitor(adapter);
+		return 0;
+	}
+
+	rtnl_lock();
+	if (!adapter->monitor_present ||
+	    test_bit(ESP_TRANSPORT_REMOVING, &adapter->state_flags) ||
+	    test_bit(ESP_DRIVER_UNLOADING, &adapter->state_flags)) {
+		rtnl_unlock();
+		return 0;
+	}
+	should_up = adapter->monitor_up;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+	wiphy_lock(adapter->wiphy);
+#endif
+	if (adapter->monitor) {
+		/* In-place reboot: user-owned monitor netdev remains registered. */
+		wdev = &adapter->monitor->wdev;
+	} else {
+		/* Older in-place teardown path. Physical remove clears the
+		 * desired-present state, and cannot reach this fallback. */
+		wdev = esp_cfg80211_add_monitor_iface(adapter->wiphy,
+				adapter->monitor_name[0] ?
+				adapter->monitor_name : "mon%d",
+				NET_NAME_USER);
+		if (IS_ERR(wdev)) {
+			ret = PTR_ERR(wdev);
+			wdev = NULL;
+		}
+	}
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+	wiphy_unlock(adapter->wiphy);
+#endif
+	/* Drop the wiphy lock before ndo_open, as in the original code:
+	 * ndo_open sends firmware commands which may use cfg80211 locks. */
+	if (!ret && wdev) {
+		ndev = wdev->netdev;
+		if (should_up && ndev && !netif_running(ndev)) {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
+			ret = dev_open(ndev, NULL);
+#else
+			ret = dev_open(ndev);
+#endif
+		}
+	}
+	rtnl_unlock();
+	return ret;
+}
+
+static struct wireless_dev *esp_cfg80211_add_virtual_iface(struct wiphy *wiphy,
+		const char *name, unsigned char name_assign_type,
+		enum nl80211_iftype type, struct vif_params *params)
+{
+	/*
+	 * Userspace virtual-interface creation is a new capability only for
+	 * monitor mode. STA/AP lifecycle remains owned by the existing Hosted
+	 * control path; exposing those internal helpers through cfg80211 would
+	 * create interfaces that esp_cfg80211_del_iface() cannot tear down.
+	 */
+	if (type != NL80211_IFTYPE_MONITOR)
+		return ERR_PTR(-EOPNOTSUPP);
+
+	return esp_cfg80211_add_monitor_iface(wiphy, name, name_assign_type);
+}
+
+/* Pre-4.12 cfg80211 supplies a separate monitor-flags argument. The
+ * common implementation already handles all supported monitor creation
+ * requests; retain its behavior for these older kernels. */
+static struct wireless_dev *esp_cfg80211_add_virtual_iface_with_flags(
+		struct wiphy *wiphy, const char *name,
+		unsigned char name_assign_type, enum nl80211_iftype type,
+		u32 *flags, struct vif_params *params)
+{
+	(void)flags;
+	return esp_cfg80211_add_virtual_iface(wiphy, name, name_assign_type,
+					     type, params);
+}
+
 struct wireless_dev *esp_cfg80211_add_iface(struct wiphy *wiphy,
 		const char *name,
 		unsigned char name_assign_type,
@@ -284,6 +961,9 @@ struct wireless_dev *esp_cfg80211_add_iface(struct wiphy *wiphy,
 		esp_info("%u invalid input\n", __LINE__);
 		return NULL;
 	}
+
+	if (type == NL80211_IFTYPE_MONITOR)
+		return esp_cfg80211_add_monitor_iface(wiphy, name, name_assign_type);
 
 	if (type == NL80211_IFTYPE_STATION) {
 		esp_nw_if_num = ESP_STA_NW_IF;
@@ -381,14 +1061,6 @@ int esp_cfg80211_register_iface(struct esp_wifi_device *priv)
 	return 0;
 }
 
-#if 0
-static int esp_cfg80211_del_iface(struct wiphy *wiphy,
-							  struct wireless_dev *wdev)
-{
-	return 0;
-}
-#endif
-
 static int esp_nl_mode_to_esp_iface(enum nl80211_iftype type)
 {
 	if (type == NL80211_IFTYPE_STATION) {
@@ -409,6 +1081,13 @@ static int8_t esp_get_mode_from_iface_type(int iface_type)
 	return WIFI_MODE_STA;
 }
 
+/* A monitor VIF allocates esp_monitor_device, not esp_wifi_device. */
+static bool esp_cfg80211_is_monitor_dev(const struct net_device *ndev)
+{
+	return ndev && ndev->ieee80211_ptr &&
+		ndev->ieee80211_ptr->iftype == NL80211_IFTYPE_MONITOR;
+}
+
 static int esp_cfg80211_change_iface(struct wiphy *wiphy,
 					struct net_device *dev,
 					enum nl80211_iftype type,
@@ -426,6 +1105,8 @@ static int esp_cfg80211_change_iface(struct wiphy *wiphy,
 		return -EINVAL;
 	}
 
+	if (esp_cfg80211_is_monitor_dev(dev))
+		return -EOPNOTSUPP;
 	priv = netdev_priv(dev);
 	if (!priv) {
 		esp_err("empty priv\n");
@@ -472,6 +1153,8 @@ static int esp_cfg80211_scan(struct wiphy *wiphy,
 	}
 
 	ndev = request->wdev->netdev;
+	if (esp_cfg80211_is_monitor_dev(ndev))
+		return -EOPNOTSUPP;
 	priv = netdev_priv(ndev);
 
 	esp_dbg("\n");
@@ -511,11 +1194,13 @@ static int esp_cfg80211_mgmt_tx(struct wiphy *wiphy, struct wireless_dev *wdev,
 {
 	struct esp_wifi_device *priv = NULL;
 
-	if (!wiphy || !wdev || !params) {
+	if (!wiphy || !wdev || !wdev->netdev || !params) {
 		esp_info("%u invalid input\n", __LINE__);
 		return -EINVAL;
 	}
 
+	if (esp_cfg80211_is_monitor_dev(wdev->netdev))
+		return -EOPNOTSUPP;
 	priv = netdev_priv(wdev->netdev);
 
 	if (!priv) {
@@ -548,6 +1233,8 @@ static int esp_cfg80211_set_default_key(struct wiphy *wiphy,
 		return -EINVAL;
 	}
 
+	if (esp_cfg80211_is_monitor_dev(dev))
+		return -EOPNOTSUPP;
 	priv = netdev_priv(dev);
 	if (!priv) {
 		esp_err("Empty priv");
@@ -580,10 +1267,14 @@ static int esp_cfg80211_del_key(struct wiphy *wiphy, struct net_device *dev,
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(7, 1, 0))
 	if (!wdev || !wdev->netdev)
 		return -EINVAL;
+	if (esp_cfg80211_is_monitor_dev(wdev->netdev))
+		return -EOPNOTSUPP;
 	priv = netdev_priv(wdev->netdev);
 #else
 	if (!dev)
 		return -EINVAL;
+	if (esp_cfg80211_is_monitor_dev(dev))
+		return -EOPNOTSUPP;
 	priv = netdev_priv(dev);
 #endif
 	if (!priv)
@@ -611,6 +1302,8 @@ static int esp_cfg80211_add_key(struct wiphy *wiphy, struct net_device *dev,
 		return -EINVAL;
 	}
 
+	if (esp_cfg80211_is_monitor_dev(dev))
+		return -EOPNOTSUPP;
 	priv = netdev_priv(dev);
 	if (!priv) {
 		esp_err("Empty priv\n");
@@ -638,6 +1331,8 @@ static int esp_cfg80211_disconnect(struct wiphy *wiphy,
 		return -EINVAL;
 	}
 
+	if (esp_cfg80211_is_monitor_dev(dev))
+		return -EOPNOTSUPP;
 	priv = netdev_priv(dev);
 
 	if (!priv) {
@@ -707,6 +1402,8 @@ static int esp_cfg80211_authenticate(struct wiphy *wiphy, struct net_device *dev
 
 	esp_dbg("\n");
 
+	if (esp_cfg80211_is_monitor_dev(dev))
+		return -EOPNOTSUPP;
 	priv = netdev_priv(dev);
 
 	if (!priv) {
@@ -731,6 +1428,8 @@ static int esp_cfg80211_associate(struct wiphy *wiphy, struct net_device *dev,
 		return -EINVAL;
 	}
 
+	if (esp_cfg80211_is_monitor_dev(dev))
+		return -EOPNOTSUPP;
 	priv = netdev_priv(dev);
 
 	esp_dbg("\n");
@@ -757,6 +1456,8 @@ static int esp_cfg80211_deauth(struct wiphy *wiphy, struct net_device *dev,
 	}
 
 	esp_dbg("\n");
+	if (esp_cfg80211_is_monitor_dev(dev))
+		return -EOPNOTSUPP;
 	priv = netdev_priv(dev);
 
 	if (!priv) {
@@ -789,6 +1490,8 @@ static int esp_cfg80211_disassoc(struct wiphy *wiphy, struct net_device *dev,
 	}
 
 	esp_dbg("\n");
+	if (esp_cfg80211_is_monitor_dev(dev))
+		return -EOPNOTSUPP;
 	priv = netdev_priv(dev);
 
 	if (!priv) {
@@ -938,6 +1641,8 @@ static int esp_cfg80211_get_station(struct wiphy *wiphy, struct net_device *ndev
 #endif
 	struct esp_wifi_device *priv = NULL;
 
+	if (esp_cfg80211_is_monitor_dev(ndev))
+		return -EOPNOTSUPP;
 	priv = netdev_priv(ndev);
 
 	if (!mac || !priv) {
@@ -985,6 +1690,14 @@ static int esp_cfg80211_get_tx_power(struct wiphy *wiphy,
 		esp_info("%u invalid input\n", __LINE__);
 		return -EINVAL;
 	}
+
+	/* A monitor VIF is receive-only and its netdev_priv contains
+	 * struct esp_monitor_device, NOT struct esp_wifi_device. cfg80211
+	 * queries all published wdevs (including mon0) for TX power; never
+	 * cast the monitor private data as a STA or send a firmware command.
+	 */
+	if (wdev->iftype == NL80211_IFTYPE_MONITOR)
+		return -EOPNOTSUPP;
 
 	esp_dbg("\n");
 	priv = netdev_priv(wdev->netdev);
@@ -1510,6 +2223,8 @@ static int esp_cfg80211_change_beacon(struct wiphy *wiphy, struct net_device *nd
 #endif
 	if (!wiphy || !ndev || !info)
 		return -EINVAL;
+	if (esp_cfg80211_is_monitor_dev(ndev))
+		return -EOPNOTSUPP;
 	priv = netdev_priv(ndev);
 	if (!priv || priv->if_type != ESP_AP_IF)
 		return -EINVAL;
@@ -1564,6 +2279,8 @@ static int esp_cfg80211_start_ap(struct wiphy *wiphy, struct net_device *dev,
 	if (!wiphy || !dev || !info)
 		return -EINVAL;
 
+	if (esp_cfg80211_is_monitor_dev(dev))
+		return -EOPNOTSUPP;
 	priv = netdev_priv(dev);
 	if (!priv || priv->if_type != ESP_AP_IF)
 		return -EINVAL;
@@ -1677,6 +2394,8 @@ static int esp_cfg80211_stop_ap(struct wiphy *wiphy, struct net_device *dev
 
 	if (!wiphy || !dev)
 		return -EINVAL;
+	if (esp_cfg80211_is_monitor_dev(dev))
+		return -EOPNOTSUPP;
 	priv = netdev_priv(dev);
 	if (!priv || priv->if_type != ESP_AP_IF)
 		return -EINVAL;
@@ -1731,6 +2450,8 @@ static int esp_cfg80211_del_station(struct wiphy *wiphy, struct net_device *dev,
 		return -EINVAL;
 	}
 
+	if (esp_cfg80211_is_monitor_dev(dev))
+		return -EOPNOTSUPP;
 	priv = netdev_priv(dev);
 	if (!priv) {
 		esp_err("empty priv\n");
@@ -1761,6 +2482,8 @@ static int esp_cfg80211_add_station(struct wiphy *wiphy, struct net_device *dev,
 		return -EINVAL;
 	}
 
+	if (esp_cfg80211_is_monitor_dev(dev))
+		return -EOPNOTSUPP;
 	priv = netdev_priv(dev);
 	if (!priv) {
 		esp_err("empty priv\n");
@@ -1792,6 +2515,8 @@ static int esp_cfg80211_change_station(struct wiphy *wiphy,
 		return -EINVAL;
 	}
 
+	if (esp_cfg80211_is_monitor_dev(dev))
+		return -EOPNOTSUPP;
 	priv = netdev_priv(dev);
 	if (!priv) {
 		esp_err("empty priv\n");
@@ -1819,11 +2544,28 @@ static int esp_cfg80211_change_station(struct wiphy *wiphy,
 	return 0;
 }
 
+/*
+ * Match the actual cfg80211_ops prototypes from the headers being compiled,
+ * not just LINUX_VERSION_CODE: distribution and stable trees can backport
+ * signature changes (e.g. set_monitor_channel's netdev argument to 6.12).
+ * Both GCC and Clang resolve this at compile time; an unknown prototype
+ * still triggers a type error rather than an unsafe function-pointer cast.
+ */
+#define ESP_CFG80211_SELECT_OP(field, modern, legacy) \
+	__builtin_choose_expr( \
+		__builtin_types_compatible_p( \
+			__typeof__(((struct cfg80211_ops *)0)->field), \
+			__typeof__(&(modern))), \
+		modern, legacy)
+
 static struct cfg80211_ops esp_cfg80211_ops = {
-#if 0
-	.add_virtual_intf = esp_cfg80211_add_iface,
+	.add_virtual_intf = ESP_CFG80211_SELECT_OP(add_virtual_intf,
+					  esp_cfg80211_add_virtual_iface,
+					  esp_cfg80211_add_virtual_iface_with_flags),
 	.del_virtual_intf = esp_cfg80211_del_iface,
-#endif
+	.set_monitor_channel = ESP_CFG80211_SELECT_OP(set_monitor_channel,
+					  esp_cfg80211_set_monitor_channel_with_dev,
+					  esp_cfg80211_set_monitor_channel),
 	.change_virtual_intf = esp_cfg80211_change_iface,
 	.scan = esp_cfg80211_scan,
 	/*.connect = esp_cfg80211_connect,*/
@@ -1948,6 +2690,16 @@ int esp_add_wiphy(struct esp_adapter *adapter)
 	set_wiphy_dev(wiphy, esp_dev->dev);
 
 	wiphy->interface_modes = BIT(NL80211_IFTYPE_STATION);
+	if (adapter->capabilities & ESP_WLAN_MONITOR_SUPPORT) {
+		wiphy->interface_modes |= BIT(NL80211_IFTYPE_MONITOR);
+		/*
+		 * The monitor VIF is a software view of the same Hosted radio,
+		 * not a second hardware MAC context. Exempt it from cfg80211
+		 * hardware interface-combination limits; firmware enforces the
+		 * single-radio/same-channel coexistence rules.
+		 */
+		wiphy->software_iftypes |= BIT(NL80211_IFTYPE_MONITOR);
+	}
 #ifdef CONFIG_AP_MODE
 	wiphy->interface_modes |= BIT(NL80211_IFTYPE_AP);
 #endif
@@ -2005,6 +2757,7 @@ int esp_add_wiphy(struct esp_adapter *adapter)
 int esp_remove_wiphy(struct esp_adapter *adapter)
 {
 	if (adapter && adapter->wiphy) {
+		esp_cfg80211_detach_monitor(adapter);
 		wiphy_unregister(adapter->wiphy);
 		wiphy_free(adapter->wiphy);
 		adapter->wiphy = NULL;

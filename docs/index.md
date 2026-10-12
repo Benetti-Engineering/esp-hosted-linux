@@ -13,6 +13,7 @@ New to ESP-Hosted-Linux? Start with [Quick start](getting-started/quick-start.md
 
 - [Wi-Fi station](guides/wifi-station.md) — scan, connect with `wpa_supplicant`, get an IP address, and debug association
 - [Wi-Fi access point](guides/wifi-access-point.md) — run `hostapd`, configure WPA2/WPA3, and add local DHCP
+- [Wi-Fi monitor mode](guides/wifi-monitor.md) — capture raw 802.11 frames with radiotap using `iw`, tcpdump, or Wireshark
 - [Bluetooth](guides/bluetooth.md) — use hosted HCI or HCI-over-UART with BlueZ
 - [IEEE 802.15.4 RCP (Thread / Zigbee)](guides/thread-rcp.md) — use the hosted Spinel/HDLC RCP through `/dev/esp_rcp0`; OpenThread is qualified end-to-end, and compatible Zigbee Radio Spinel stacks use the same RCP protocol
 - [Host sleep](guides/host-sleep.md) — suspend a Linux host and wake it from ESP over the SDIO host-wakeup path

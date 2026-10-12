@@ -19,6 +19,7 @@
 #include <inttypes.h>
 #include <string.h>
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "sys/queue.h"
 #include "soc/soc.h"
 #include "soc/soc_caps.h"
@@ -388,6 +389,561 @@ static int wifi_tx_with_retry(wifi_interface_t wifi_if, uint8_t *payload,
 #endif
 
 #define ETH_DATA_LEN            1500
+#define MONITOR_DROP_LOG_INTERVAL 1024U
+
+static volatile bool s_monitor_enabled;
+static uint8_t s_monitor_channel; /* last successfully configured channel */
+static bool s_monitor_channel_explicit; /* zero-channel request inherits STA/AP */
+static uint8_t s_monitor_rx_channel; /* last observed captured frame */
+static uint32_t s_monitor_rx_packets;
+static uint32_t s_monitor_rx_bytes;
+/* Callback vs successfully enqueued counts distinguish Wi-Fi firmware filtering
+ * from later firmware queue/transport losses without per-frame logging. */
+static uint32_t s_monitor_cb_mgmt;
+static uint32_t s_monitor_cb_ctrl;
+static uint32_t s_monitor_cb_data;
+static uint32_t s_monitor_tx_mgmt;
+static uint32_t s_monitor_tx_ctrl;
+static uint32_t s_monitor_tx_data;
+static uint32_t s_monitor_queue_drops;
+static uint32_t s_monitor_alloc_drops;
+static uint32_t s_monitor_oversize_drops;
+
+static void monitor_log_drop(const char *reason)
+{
+    uint32_t drops = s_monitor_queue_drops + s_monitor_alloc_drops +
+                     s_monitor_oversize_drops;
+
+    if ((drops % MONITOR_DROP_LOG_INTERVAL) == 1U) {
+        ESP_LOGW(TAG, "MONITOR_DROP reason=%s queue=%"PRIu32" alloc=%"PRIu32
+                 " oversize=%"PRIu32" rx=%"PRIu32" bytes=%"PRIu32,
+                 reason, s_monitor_queue_drops, s_monitor_alloc_drops,
+                 s_monitor_oversize_drops, s_monitor_rx_packets,
+                 s_monitor_rx_bytes);
+    }
+}
+
+static uint8_t monitor_normalize_phy(const wifi_pkt_rx_ctrl_t *rx)
+{
+#if CONFIG_SOC_WIFI_HE_SUPPORT
+    switch (rx->cur_bb_format) {
+    case RX_BB_FORMAT_HT:
+        return 1;
+    case RX_BB_FORMAT_VHT:
+    case RX_BB_FORMAT_VHT_MU:
+        return 2;
+    case RX_BB_FORMAT_HE_SU:
+    case RX_BB_FORMAT_HE_MU:
+    case RX_BB_FORMAT_HE_ERSU:
+    case RX_BB_FORMAT_HE_TB:
+        return 3;
+    default:
+        return 0;
+    }
+#else
+    if (rx->sig_mode == 1)
+        return 1;
+    if (rx->sig_mode == 3)
+        return 2;
+    return 0;
+#endif
+}
+
+static void monitor_rx_cb(void *buf, wifi_promiscuous_pkt_type_t type)
+{
+    const wifi_promiscuous_pkt_t *pkt = buf;
+    const wifi_pkt_rx_ctrl_t *rx;
+    interface_buffer_handle_t out = {0};
+    struct esp_monitor_meta_v1 *meta;
+    uint8_t *payload;
+    uint16_t frame_len;
+    size_t total_len;
+
+    if (!s_monitor_enabled || !buf)
+        return;
+
+    /* Keep callback counts ahead of resource checks: if the Wi-Fi library
+     * delivers control frames but the transport does not, we can prove it. */
+    switch (type) {
+    case WIFI_PKT_MGMT:
+        s_monitor_cb_mgmt++;
+        break;
+    case WIFI_PKT_CTRL:
+        s_monitor_cb_ctrl++;
+        if (s_monitor_cb_ctrl == 1U)
+            ESP_LOGI(TAG, "MONITOR_CTRL_FIRST_RX received from Wi-Fi library");
+        break;
+    case WIFI_PKT_DATA:
+        s_monitor_cb_data++;
+        break;
+    default:
+        return;
+    }
+    if (!datapath || !to_host_queue[PRIO_Q_LOW])
+        return;
+
+    rx = &pkt->rx_ctrl;
+    if (!rx->sig_len)
+        return;
+
+    frame_len = (uint16_t)rx->sig_len;
+    total_len = sizeof(*meta) + frame_len;
+    if (total_len > MAX_ALLOWED_BUF_PAYLOAD_LEN || total_len > UINT16_MAX) {
+        s_monitor_oversize_drops++;
+        monitor_log_drop("oversize");
+        return;
+    }
+
+    /* Keep sniffer load bounded by the existing low-priority transport queue.
+     * Never block the Wi-Fi task waiting for host transport capacity. */
+    if (!uxQueueSpacesAvailable(to_host_queue[PRIO_Q_LOW])) {
+        s_monitor_queue_drops++;
+        monitor_log_drop("queue-full");
+        return;
+    }
+
+    payload = heap_caps_malloc(total_len, MALLOC_CAP_DMA);
+    if (!payload) {
+        s_monitor_alloc_drops++;
+        monitor_log_drop("alloc");
+        return;
+    }
+
+    meta = (struct esp_monitor_meta_v1 *)payload;
+    memset(meta, 0, sizeof(*meta));
+    meta->version = ESP_MONITOR_META_VERSION;
+    meta->frame_type = (uint8_t)type;
+    meta->channel = (uint8_t)rx->channel;
+    if (meta->channel)
+        s_monitor_rx_channel = meta->channel;
+    meta->rssi = (int8_t)rx->rssi;
+    meta->rate = 0xff;
+    meta->sig_mode = monitor_normalize_phy(rx);
+    meta->mcs = 0xff;
+    meta->antenna = 0xff;
+#if CONFIG_SOC_WIFI_HE_SUPPORT
+    /*
+     * HE-capable targets use esp_wifi_rxctrl_t, whose layout is selected by
+     * the target's Wi-Fi MAC version.  Access only fields common to those
+     * IDF-defined layouts instead of interpreting raw descriptor bytes.
+     *
+     * In this descriptor family "rate" is the 11b transmission-rate field
+     * only for RX_BB_FORMAT_11B and is the L-SIG Rate field otherwise; it is
+     * not the legacy wifi_phy_rate_t encoding consumed by our v1 metadata.
+     * Leave rate unknown rather than publishing a fabricated radiotap rate.
+     */
+    meta->cwb = rx->second != WIFI_SECOND_CHAN_NONE;
+    meta->secondary_channel = (uint8_t)rx->second;
+    if (rx->cur_bb_format == RX_BB_FORMAT_11B)
+        meta->flags |= ESP_MONITOR_FLAG_CCK;
+    if (rx->dump_len && rx->sig_len == rx->dump_len + 4)
+        meta->flags |= ESP_MONITOR_FLAG_FCS_PRESENT;
+#else
+    /*
+     * Legacy targets expose the older wifi_pkt_rx_ctrl_t descriptor where
+     * rate/MCS/bandwidth/GI/antenna are directly documented by ESP-IDF.
+     */
+    meta->rate = (uint8_t)rx->rate;
+    meta->mcs = (uint8_t)rx->mcs;
+    meta->cwb = (uint8_t)rx->cwb;
+    meta->secondary_channel = (uint8_t)rx->secondary_channel;
+    meta->antenna = (uint8_t)rx->ant;
+    if (rx->sgi)
+        meta->flags |= ESP_MONITOR_FLAG_SHORT_GI;
+    if (rx->sig_mode == 0 &&
+        (rx->rate == WIFI_PHY_RATE_1M_L ||
+         rx->rate == WIFI_PHY_RATE_2M_L ||
+         rx->rate == WIFI_PHY_RATE_2M_S ||
+         rx->rate == WIFI_PHY_RATE_5M_L ||
+         rx->rate == WIFI_PHY_RATE_5M_S ||
+         rx->rate == WIFI_PHY_RATE_11M_L ||
+         rx->rate == WIFI_PHY_RATE_11M_S))
+        meta->flags |= ESP_MONITOR_FLAG_CCK;
+    meta->flags |= ESP_MONITOR_FLAG_FCS_PRESENT;
+#endif
+    if (meta->sig_mode == 1)
+        meta->flags |= ESP_MONITOR_FLAG_HT;
+    meta->frame_len = htole16(frame_len);
+    meta->timestamp_us = htole32((uint32_t)rx->timestamp);
+    memcpy(payload + sizeof(*meta), pkt->payload, frame_len);
+
+    out.if_type = ESP_MONITOR_IF;
+    out.if_num = 0;
+    out.payload = payload;
+    out.payload_len = (uint16_t)total_len;
+    out.pkt_type = PACKET_TYPE_MONITOR;
+    out.priv_buffer_handle = payload;
+    out.free_buf_handle = free;
+
+    if (send_to_host_timeout(PRIO_Q_LOW, &out, 0) != pdTRUE) {
+        s_monitor_queue_drops++;
+        monitor_log_drop("queue-race");
+        free(payload);
+        return;
+    }
+
+    s_monitor_rx_packets++;
+    s_monitor_rx_bytes += frame_len;
+    switch (type) {
+    case WIFI_PKT_MGMT:
+        s_monitor_tx_mgmt++;
+        break;
+    case WIFI_PKT_CTRL:
+        s_monitor_tx_ctrl++;
+        break;
+    case WIFI_PKT_DATA:
+        s_monitor_tx_data++;
+        break;
+    default:
+        break;
+    }
+
+    /* A bounded UART trace allows hardware tests to diagnose whether
+     * control frames reach the Wi-Fi callback without shutting down mon0. */
+    if ((s_monitor_rx_packets & 2047U) == 0U) {
+        ESP_LOGI(TAG, "MONITOR_TYPE_COUNTS cb_mgmt=%"PRIu32
+                 " cb_ctrl=%"PRIu32" cb_data=%"PRIu32
+                 " queued_mgmt=%"PRIu32" queued_ctrl=%"PRIu32
+                 " queued_data=%"PRIu32" queue_drop=%"PRIu32,
+                 s_monitor_cb_mgmt, s_monitor_cb_ctrl, s_monitor_cb_data,
+                 s_monitor_tx_mgmt, s_monitor_tx_ctrl, s_monitor_tx_data,
+                 s_monitor_queue_drops);
+    }
+}
+
+bool esp_hosted_monitor_is_enabled(void)
+{
+    return s_monitor_enabled;
+}
+
+/*
+ * Preserve the *operating* channel while a shared STA/AP still owns it.
+ * Deinit disconnects STA before stopping Wi-Fi; after that point IDF may
+ * already report the monitor-only fallback channel instead of the channel
+ * on which the connected STA was operating. Keep the inherited/pinned
+ * distinction unchanged by this snapshot.
+ */
+void esp_hosted_monitor_snapshot_channel(void)
+{
+    wifi_mode_t mode = WIFI_MODE_NULL;
+    wifi_second_chan_t second = WIFI_SECOND_CHAN_NONE;
+    wifi_ap_record_t associated_ap = {0};
+    uint8_t current_channel = 0;
+    bool connected_sta;
+    bool active_ap;
+
+    if (!s_monitor_enabled || s_monitor_channel_explicit)
+        return;
+    if (esp_wifi_get_mode(&mode) != ESP_OK)
+        return;
+
+    connected_sta = (mode == WIFI_MODE_STA || mode == WIFI_MODE_APSTA) &&
+                    esp_wifi_sta_get_ap_info(&associated_ap) == ESP_OK;
+    /* AP interfaces are configured in APSTA mode by Hosted. Require an
+     * active AP_START event before treating APSTA-without-STA as an owner;
+     * APSTA mode alone is not proof that the radio is operating an AP. */
+    active_ap = mode == WIFI_MODE_AP ||
+                (mode == WIFI_MODE_APSTA && softap_started);
+    if (!connected_sta && !active_ap)
+        return;
+    if (esp_wifi_get_channel(&current_channel, &second) == ESP_OK &&
+        current_channel) {
+        if (current_channel != s_monitor_channel)
+            ESP_LOGI(TAG, "MONITOR_INHERITED_CHANNEL_SNAPSHOT %u -> %u",
+                     s_monitor_channel, current_channel);
+        s_monitor_channel = current_channel;
+    }
+}
+
+uint8_t esp_hosted_monitor_channel(void)
+{
+    wifi_mode_t mode = WIFI_MODE_NULL;
+    wifi_second_chan_t second = WIFI_SECOND_CHAN_NONE;
+    wifi_ap_record_t connected_ap = {0};
+    uint8_t current_channel = 0;
+
+    if (!s_monitor_enabled || s_monitor_channel_explicit)
+        return s_monitor_channel;
+
+    /* Capture with an inherited channel follows the actual radio. RX
+     * metadata cannot update configuration: queued old packets may arrive
+     * after a legitimate STA/AP channel transition. */
+    if (esp_wifi_get_mode(&mode) == ESP_OK &&
+        (mode == WIFI_MODE_AP || mode == WIFI_MODE_APSTA ||
+         (mode == WIFI_MODE_STA &&
+          esp_wifi_sta_get_ap_info(&connected_ap) == ESP_OK)) &&
+        esp_wifi_get_channel(&current_channel, &second) == ESP_OK &&
+        current_channel)
+        return current_channel;
+
+    return s_monitor_channel;
+}
+
+bool esp_hosted_monitor_channel_allowed(uint8_t requested, bool radio_transition)
+{
+    if (!s_monitor_enabled)
+        return true;
+    if (!requested)
+        return false;
+    /* Only explicitly pinned monitor channels constrain STA/AP roaming or
+     * setup. For inherited monitoring, the owner of the shared radio may
+     * retune it; passive scans must remain on the live operating channel. */
+    if (!s_monitor_channel_explicit && radio_transition)
+        return true;
+    return requested == esp_hosted_monitor_channel();
+}
+
+esp_err_t esp_hosted_monitor_restore(void)
+{
+    if (!s_monitor_enabled)
+        return ESP_OK;
+    if (!s_monitor_channel)
+        return ESP_ERR_INVALID_STATE;
+    return esp_hosted_monitor_config(true,
+                                     s_monitor_channel_explicit ?
+                                     s_monitor_channel : 0);
+}
+
+esp_err_t esp_hosted_monitor_config(bool enable, uint8_t channel)
+{
+    wifi_promiscuous_filter_t filter = {
+        .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT |
+                       WIFI_PROMIS_FILTER_MASK_CTRL |
+                       WIFI_PROMIS_FILTER_MASK_DATA,
+    };
+    wifi_promiscuous_filter_t ctrl_filter = {
+        .filter_mask = WIFI_PROMIS_CTRL_FILTER_MASK_ALL,
+    };
+    wifi_promiscuous_filter_t readback = {0};
+    wifi_promiscuous_filter_t old_filter = {0};
+    wifi_promiscuous_filter_t old_ctrl_filter = {0};
+    wifi_mode_t current_mode = WIFI_MODE_NULL;
+    wifi_second_chan_t second_channel = WIFI_SECOND_CHAN_NONE;
+    wifi_ap_record_t associated_ap = {0};
+    bool sta_owns_channel = false;
+    bool radio_owns_channel;
+    uint8_t operating_channel = 0;
+    uint8_t previous_channel = 0;
+    wifi_second_chan_t previous_second = WIFI_SECOND_CHAN_NONE;
+    uint8_t effective_channel = channel;
+    bool was_enabled = s_monitor_enabled;
+    bool rollback_failed = false;
+    esp_err_t ret;
+
+    if (!enable) {
+        bool was_enabled = s_monitor_enabled;
+
+        s_monitor_enabled = false;
+        ret = esp_wifi_set_promiscuous(false);
+        if (ret != ESP_OK && ret != ESP_ERR_WIFI_NOT_STARTED) {
+            s_monitor_enabled = was_enabled;
+            return ret;
+        }
+        ESP_LOGI(TAG, "Monitor disabled: rx=%"PRIu32" bytes=%"PRIu32
+                 " queue_drop=%"PRIu32" alloc_drop=%"PRIu32
+                 " oversize_drop=%"PRIu32,
+                 s_monitor_rx_packets, s_monitor_rx_bytes,
+                 s_monitor_queue_drops, s_monitor_alloc_drops,
+                 s_monitor_oversize_drops);
+        ESP_LOGI(TAG, "MONITOR_TYPE_COUNTS cb_mgmt=%"PRIu32
+                 " cb_ctrl=%"PRIu32" cb_data=%"PRIu32
+                 " queued_mgmt=%"PRIu32" queued_ctrl=%"PRIu32
+                 " queued_data=%"PRIu32,
+                 s_monitor_cb_mgmt, s_monitor_cb_ctrl, s_monitor_cb_data,
+                 s_monitor_tx_mgmt, s_monitor_tx_ctrl, s_monitor_tx_data);
+        return ESP_OK;
+    }
+
+    /*
+     * A zero enable-channel means "inherit the current shared-radio channel".
+     * Linux cfg80211 6.1 only allows .set_monitor_channel while monitor is the
+     * sole running interface, so an already-active STA/AP must be inherited
+     * at monitor-open time instead of requiring an impossible userspace retune.
+     */
+    /* Association and scans can own the radio channel before their
+     * completion events set station_connected or scan state to idle. */
+    if (esp_hosted_wifi_channel_transition_active()) {
+        ESP_LOGW(TAG, "MONITOR_CONFIG_REJECT channel transition active");
+        return ESP_ERR_INVALID_STATE;
+    }
+    ret = esp_wifi_get_mode(&current_mode);
+    if (ret != ESP_OK)
+        return ret;
+
+    /*
+     * The AP configuration's channel is not necessarily the operating
+     * channel: in APSTA mode the STA channel takes precedence.
+     * Similarly softap_started can lag a synchronous mode transition.
+     */
+    /* Do not trust station_connected across a rapid stop/restart: its
+     * WIFI_EVENT_STA_DISCONNECTED notification can lag the mode change. */
+    if (current_mode == WIFI_MODE_STA || current_mode == WIFI_MODE_APSTA)
+        sta_owns_channel = esp_wifi_sta_get_ap_info(&associated_ap) == ESP_OK;
+    radio_owns_channel = sta_owns_channel ||
+                         current_mode == WIFI_MODE_AP ||
+                         current_mode == WIFI_MODE_APSTA;
+    if (radio_owns_channel) {
+        ret = esp_wifi_get_channel(&operating_channel, &second_channel);
+        if (ret != ESP_OK)
+            return ret;
+        /* Never retune an active shared radio on an unresolved channel. */
+        if (!operating_channel)
+            return ESP_ERR_INVALID_STATE;
+        if (channel && channel != operating_channel) {
+            ESP_LOGW(TAG, "Monitor channel %u conflicts with operating channel %u",
+                     channel, operating_channel);
+            return ESP_ERR_INVALID_STATE;
+        }
+        effective_channel = operating_channel;
+    }
+
+    /* Channel 0 means inherit, not "switch to channel 1". If an existing
+     * monitor survives WLAN teardown, restore its last real channel even
+     * after the STA/AP role stops owning the radio. A genuinely new
+     * monitor-only instance still starts on channel 1. */
+    if (!effective_channel)
+        effective_channel = was_enabled && s_monitor_channel ?
+                            s_monitor_channel : 1;
+
+    if (was_enabled) {
+        /* Snapshot filters before modifying a running monitor interface.
+         * A rejected channel change must not change its capture policy. */
+        ret = esp_wifi_get_promiscuous_filter(&old_filter);
+        if (ret != ESP_OK)
+            return ret;
+        ret = esp_wifi_get_promiscuous_ctrl_filter(&old_ctrl_filter);
+        if (ret != ESP_OK)
+            return ret;
+    }
+    if (!radio_owns_channel) {
+        ret = esp_wifi_get_channel(&previous_channel, &previous_second);
+        if (ret != ESP_OK)
+            return ret;
+    }
+
+    ESP_LOGI(TAG, "MONITOR_ENABLE_STAGE filter begin channel=%u", effective_channel);
+    ret = esp_wifi_set_promiscuous_filter(&filter);
+    ESP_LOGI(TAG, "MONITOR_ENABLE_STAGE filter done ret=%d", ret);
+    if (ret != ESP_OK)
+        goto config_failed;
+
+    /* The type mask alone does not explicitly select control subtypes.
+     * Request all control subtypes so ACK/RTS/CTS/BA/BAR are not excluded. */
+    ESP_LOGI(TAG, "MONITOR_CTRL_FILTER_SET mask=0x%08"PRIx32,
+             ctrl_filter.filter_mask);
+    ret = esp_wifi_set_promiscuous_ctrl_filter(&ctrl_filter);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "MONITOR_CTRL_FILTER_SET_FAILED ret=%d", ret);
+        goto config_failed;
+    }
+    ret = esp_wifi_get_promiscuous_ctrl_filter(&readback);
+    if (ret != ESP_OK || readback.filter_mask != ctrl_filter.filter_mask) {
+        ESP_LOGE(TAG, "MONITOR_CTRL_FILTER_VERIFY_FAILED ret=%d expected=0x%08"PRIx32
+                 " got=0x%08"PRIx32, ret, ctrl_filter.filter_mask,
+                 readback.filter_mask);
+        ret = ret == ESP_OK ? ESP_FAIL : ret;
+        goto config_failed;
+    }
+    ESP_LOGI(TAG, "MONITOR_CTRL_FILTER_VERIFIED mask=0x%08"PRIx32,
+             readback.filter_mask);
+    memset(&readback, 0, sizeof(readback));
+    ret = esp_wifi_get_promiscuous_filter(&readback);
+    if (ret != ESP_OK ||
+        (readback.filter_mask & filter.filter_mask) != filter.filter_mask) {
+        ESP_LOGE(TAG, "MONITOR_TYPE_FILTER_VERIFY_FAILED ret=%d expected=0x%08"PRIx32
+                 " got=0x%08"PRIx32, ret, filter.filter_mask, readback.filter_mask);
+        ret = ret == ESP_OK ? ESP_FAIL : ret;
+        goto config_failed;
+    }
+    ESP_LOGI(TAG, "MONITOR_TYPE_FILTER_VERIFIED mask=0x%08"PRIx32,
+             readback.filter_mask);
+    ESP_LOGI(TAG, "MONITOR_ENABLE_STAGE rx_callback begin");
+    ret = esp_wifi_set_promiscuous_rx_cb(monitor_rx_cb);
+    ESP_LOGI(TAG, "MONITOR_ENABLE_STAGE rx_callback done ret=%d", ret);
+    if (ret != ESP_OK)
+        goto config_failed;
+    ESP_LOGI(TAG, "MONITOR_ENABLE_STAGE promiscuous_on begin");
+    ret = esp_wifi_set_promiscuous(true);
+    ESP_LOGI(TAG, "MONITOR_ENABLE_STAGE promiscuous_on done ret=%d", ret);
+    if (ret != ESP_OK)
+        goto config_failed;
+
+    /* Commit the retune LAST: filter/verification/callback failures must
+     * never move the physical channel while the host retains the old one. */
+    if (!radio_owns_channel &&
+        (effective_channel != previous_channel ||
+         previous_second != WIFI_SECOND_CHAN_NONE)) {
+        ret = esp_wifi_set_channel(effective_channel, WIFI_SECOND_CHAN_NONE);
+        if (ret != ESP_OK)
+            goto config_failed;
+    }
+
+    s_monitor_channel = effective_channel;
+    s_monitor_channel_explicit = channel != 0;
+    s_monitor_enabled = true;
+    ESP_LOGI(TAG, "Monitor enabled on channel %u%s", effective_channel,
+             s_monitor_channel_explicit ? " (explicit)" : " (inherited)");
+    return ESP_OK;
+
+config_failed:
+    /* ESP-IDF may partially apply a command before returning a failure.
+     * Restore capture filters and verify the radio did not move. If the
+     * previous channel cannot be recovered, a firmware restart is safer
+     * than acknowledging a failed operation with ambiguous RF state. */
+    if (!radio_owns_channel) {
+        uint8_t observed_channel = 0;
+        wifi_second_chan_t observed_second = WIFI_SECOND_CHAN_NONE;
+        esp_err_t verify = esp_wifi_get_channel(&observed_channel,
+                                                &observed_second);
+
+        if (verify != ESP_OK)
+            rollback_failed = true;
+        else if (observed_channel != previous_channel ||
+                 observed_second != previous_second) {
+            if (!previous_channel ||
+                esp_wifi_set_channel(previous_channel, previous_second) != ESP_OK)
+                rollback_failed = true;
+            else {
+                uint8_t restored_channel = 0;
+                wifi_second_chan_t restored_second = WIFI_SECOND_CHAN_NONE;
+
+                if (esp_wifi_get_channel(&restored_channel, &restored_second) != ESP_OK ||
+                    restored_channel != previous_channel ||
+                    restored_second != previous_second)
+                    rollback_failed = true;
+            }
+        }
+    }
+    if (was_enabled) {
+        esp_err_t filter_ret = esp_wifi_set_promiscuous_filter(&old_filter);
+        esp_err_t ctrl_ret = esp_wifi_set_promiscuous_ctrl_filter(&old_ctrl_filter);
+        esp_err_t enable_ret = esp_wifi_set_promiscuous(true);
+
+        /* A failure in the first rollback step must not suppress the
+         * independent cleanup attempts that follow it. */
+        if (filter_ret != ESP_OK || ctrl_ret != ESP_OK ||
+            enable_ret != ESP_OK) {
+            ESP_LOGE(TAG, "MONITOR_CONFIG_FILTER_ROLLBACK_FAILED filter=%d ctrl=%d enable=%d",
+                     filter_ret, ctrl_ret, enable_ret);
+            rollback_failed = true;
+        }
+    } else {
+        esp_err_t disable_ret = esp_wifi_set_promiscuous(false);
+
+        /* A stopped radio cannot retain active capture. No need for a
+         * second restart merely because rollback observes that state. */
+        if (disable_ret != ESP_OK &&
+            disable_ret != ESP_ERR_WIFI_NOT_STARTED &&
+            disable_ret != ESP_ERR_WIFI_NOT_INIT)
+            rollback_failed = true;
+    }
+    if (rollback_failed) {
+        ESP_LOGE(TAG, "MONITOR_CONFIG_ROLLBACK_FAILED ret=%d; restarting", ret);
+        esp_restart();
+    }
+    return ret;
+}
+
 
 uint8_t dev_mac[MAC_ADDR_LEN] = {0};
 
@@ -425,6 +981,11 @@ static uint32_t get_capabilities()
 #else
     ESP_LOGI(TAG, "- WLAN over SDIO");
     cap |= ESP_WLAN_SDIO_SUPPORT;
+#endif
+
+#if CONFIG_SOC_WIFI_SUPPORTED
+    ESP_LOGI(TAG, "- WLAN monitor mode");
+    cap |= ESP_WLAN_MONITOR_SUPPORT;
 #endif
 
 #if SOC_WIFI_GCMP_SUPPORT

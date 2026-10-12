@@ -1101,6 +1101,29 @@ static int decode_common_resp(struct command_node *cmd_node)
 	return ret;
 }
 
+static int decode_monitor_resp(struct command_node *cmd_node)
+{
+	struct command_header *cmd;
+
+	if (!cmd_node || !cmd_node->resp_skb || !cmd_node->resp_skb->data ||
+	    cmd_node->resp_skb->len < sizeof(*cmd))
+		return -EIO;
+
+	cmd = (struct command_header *)cmd_node->resp_skb->data;
+	switch (cmd->cmd_status) {
+	case CMD_RESPONSE_SUCCESS:
+		return 0;
+	case CMD_RESPONSE_BUSY:
+		return -EBUSY;
+	case CMD_RESPONSE_INVALID:
+		return -EINVAL;
+	case CMD_RESPONSE_UNSUPPORTED:
+		return -EOPNOTSUPP;
+	default:
+		return -EIO;
+	}
+}
+
 static void recycle_cmd_node(struct esp_adapter *adapter,
 		struct command_node *cmd_node)
 {
@@ -1156,6 +1179,7 @@ static bool esp_cmd_timeout_is_commit_ambiguous(u8 cmd_code)
 	case CMD_START_OTA_WRITE:
 	case CMD_START_OTA_END:
 	case CMD_SET_RADIO_SERVICE:
+	case CMD_MONITOR_CONFIG:
 		return true;
 	default:
 		return false;
@@ -1370,6 +1394,10 @@ static int wait_and_decode_cmd_resp(struct esp_wifi_device *priv,
 		/* intentional fallthrough */
 		if (ret == 0)
 			ret = decode_common_resp(cmd_node);
+		break;
+	case CMD_MONITOR_CONFIG:
+		if (ret == 0)
+			ret = decode_monitor_resp(cmd_node);
 		break;
 
 	case CMD_SET_RADIO_SERVICE:
@@ -1609,22 +1637,16 @@ static void destroy_cmd_wq(struct esp_adapter *adapter)
 
 }
 
-static struct command_node *prepare_command_request(struct esp_adapter *adapter, u8 cmd_code, size_t len)
+static struct command_node *prepare_command_request_for_if(struct esp_adapter *adapter,
+		u8 if_type, u8 cmd_code, size_t len)
 {
 	struct command_header *cmd;
 	struct esp_payload_header *payload_header;
 	struct command_node *node = NULL;
-	struct esp_wifi_device *priv;
 
 	if (!adapter) {
 		esp_info("%u null adapter\n", __LINE__);
 		return ERR_PTR(-EINVAL);
-	}
-
-	priv = adapter->priv[0];
-	if (!priv) {
-		esp_err("No command interface context\n");
-		return ERR_PTR(-ENODEV);
 	}
 
 	if (!cmd_code || cmd_code >= CMD_MAX) {
@@ -1684,7 +1706,7 @@ static struct command_node *prepare_command_request(struct esp_adapter *adapter,
 	payload_header = (struct esp_payload_header *)skb_put(node->cmd_skb, len);
 	memset(payload_header, 0, len);
 
-	payload_header->if_type = priv->if_type;
+	payload_header->if_type = if_type;
 	payload_header->len = esp_wire_cpu_to_le16(
 		len - sizeof(struct esp_payload_header));
 	payload_header->offset = esp_wire_cpu_to_le16(
@@ -1698,6 +1720,23 @@ static struct command_node *prepare_command_request(struct esp_adapter *adapter,
 
 /*	payload_header->checksum = cpu_to_le16(compute_checksum(skb->data, len));*/
 	return node;
+}
+
+static struct command_node *prepare_command_request(struct esp_adapter *adapter,
+		u8 cmd_code, size_t len)
+{
+	struct esp_wifi_device *priv;
+
+	if (!adapter)
+		return ERR_PTR(-EINVAL);
+
+	priv = adapter->priv[ESP_STA_NW_IF];
+	if (!priv) {
+		esp_err("No command interface context\n");
+		return ERR_PTR(-ENODEV);
+	}
+
+	return prepare_command_request_for_if(adapter, priv->if_type, cmd_code, len);
 }
 
 static int cmd_prepare_err(struct command_node *node)
@@ -3195,6 +3234,46 @@ int cmd_deinit_interface(struct esp_wifi_device *priv)
 	RET_ON_FAIL(wait_and_decode_cmd_resp(priv, cmd_node));
 
 	return 0;
+}
+
+int cmd_monitor_config(struct esp_adapter *adapter, bool enable, u8 channel)
+{
+	struct esp_wifi_device *control_priv;
+	struct command_node *cmd_node;
+	struct cmd_monitor_config *cfg;
+	int ret;
+
+	if (!adapter)
+		return -EINVAL;
+
+	control_priv = adapter->priv[ESP_STA_NW_IF];
+	if (!control_priv)
+		return -ENODEV;
+
+	cmd_node = prepare_command_request_for_if(adapter, ESP_MONITOR_IF,
+						  CMD_MONITOR_CONFIG,
+						  sizeof(*cfg));
+	if (IS_ERR_OR_NULL(cmd_node))
+		return cmd_prepare_err(cmd_node);
+
+	cfg = (struct cmd_monitor_config *)(cmd_node->cmd_skb->data +
+					     sizeof(struct esp_payload_header));
+	cfg->enable = enable ? 1 : 0;
+	cfg->channel = channel;
+	cfg->secondary_channel = 0;
+	cfg->reserved = 0;
+
+	ret = queue_cmd_node(adapter, cmd_node, ESP_CMD_DFLT_PRIO);
+	if (ret) {
+		recycle_cmd_node(adapter, cmd_node);
+		return ret;
+	}
+
+	/*
+	 * control_priv is only the generic synchronous-response waiter context.
+	 * The transport record above is explicitly addressed to ESP_MONITOR_IF.
+	 */
+	return wait_and_decode_cmd_resp(control_priv, cmd_node);
 }
 
 int internal_scan_request(struct esp_wifi_device *priv, char *ssid,

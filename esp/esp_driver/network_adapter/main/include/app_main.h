@@ -17,6 +17,8 @@
 #ifndef __NETWORK_ADAPTER_PRIV__H
 #define __NETWORK_ADAPTER_PRIV__H
 
+#include <stdbool.h>
+#include "esp_err.h"
 #include "adapter.h"
 
 typedef struct {
@@ -30,5 +32,13 @@ struct wow_config {
     uint8_t four_way_handshake;
     uint8_t eap_identity_req;
 };
+
+bool esp_hosted_wifi_channel_transition_active(void);
+bool esp_hosted_monitor_is_enabled(void);
+uint8_t esp_hosted_monitor_channel(void);
+void esp_hosted_monitor_snapshot_channel(void);
+bool esp_hosted_monitor_channel_allowed(uint8_t requested, bool radio_transition);
+esp_err_t esp_hosted_monitor_restore(void);
+esp_err_t esp_hosted_monitor_config(bool enable, uint8_t channel);
 
 #endif

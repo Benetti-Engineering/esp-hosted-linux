@@ -18,6 +18,9 @@ struct wireless_dev *esp_cfg80211_add_iface(struct wiphy *wiphy,
 int esp_cfg80211_register_iface(struct esp_wifi_device *priv);
 int esp_add_wiphy(struct esp_adapter *adapter);
 int esp_remove_wiphy(struct esp_adapter *adapter);
+void esp_cfg80211_monitor_rx(struct esp_adapter *adapter, struct sk_buff *skb);
+void esp_cfg80211_detach_monitor(struct esp_adapter *adapter);
+int esp_cfg80211_restore_monitor(struct esp_adapter *adapter);
 int esp_mark_disconnect(struct esp_wifi_device *priv, uint16_t reason,
 		uint8_t locally_disconnect);
 int esp_mark_scan_done_and_disconnect(struct esp_wifi_device *priv,

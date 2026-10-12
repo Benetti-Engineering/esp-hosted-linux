@@ -21,6 +21,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/timers.h"
+#include "freertos/semphr.h"
 #include "esp_private/wifi.h"
 #include "esp_wpa.h"
 #include "app_main.h"
@@ -36,6 +37,18 @@
 #include "esp_app_format.h"
 
 #define TAG "FW_CMD"
+
+/* Serializes scan ownership across Wi-Fi stop/start without waiting in the
+ * packet path. Event-loop FIFO ordering fences completions from the prior
+ * Wi-Fi incarnation before a replacement scan may be submitted. */
+ESP_EVENT_DEFINE_BASE(HOSTED_SCAN_LIFECYCLE_EVENT);
+#define HOSTED_SCAN_EVENT_FENCE 1
+/* CMD_DEINIT_INTERFACE / CMD_SET_MODE share a 5-second host timeout.
+ * Leave at least one second for command response and transport scheduling. */
+#define HOSTED_WIFI_STOP_BUDGET_MS 3000U
+#define HOSTED_WIFI_COMMAND_BUDGET_MS 3500U
+#define HOSTED_WIFI_EVENT_ACK_WARN_MS 750U
+#define HOSTED_WIFI_FENCE_POST_WAIT_MS 200U
 
 static bool verify_ota = false;
 static uint8_t broadcast_mac[ETH_ALEN] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
@@ -121,7 +134,106 @@ volatile uint8_t active_cmd_code;
 static portMUX_TYPE s_mgmt_tx_lock = portMUX_INITIALIZER_UNLOCKED;
 static bool s_mgmt_tx_pending;
 static bool s_mgmt_cb_owned;
-static bool s_wifi_started;
+static volatile bool s_wifi_started;
+static volatile bool s_wifi_stop_in_progress;
+static volatile bool s_sta_stop_ack_pending;
+static volatile bool s_scan_in_progress;
+static volatile bool s_scan_drain_pending;
+static portMUX_TYPE s_scan_lock = portMUX_INITIALIZER_UNLOCKED;
+static esp_event_handler_instance_t s_scan_fence_instance;
+static SemaphoreHandle_t s_wifi_stop_ack;
+static uint32_t s_wifi_slow_ack_count;
+/* Command handlers may perform configuration and restart after stopping.
+ * Reserve time in the host's 5s command timeout for those operations. */
+static TickType_t s_cmd_started_at;
+static bool s_cmd_in_progress;
+static volatile bool s_auth_scan_in_progress;
+
+static TickType_t hosted_wifi_stop_remaining(TickType_t stop_started)
+{
+    TickType_t elapsed = xTaskGetTickCount() - stop_started;
+    TickType_t budget = pdMS_TO_TICKS(HOSTED_WIFI_STOP_BUDGET_MS);
+
+    TickType_t remaining = elapsed >= budget ? 0 : budget - elapsed;
+
+    if (s_cmd_in_progress) {
+        TickType_t cmd_elapsed = xTaskGetTickCount() - s_cmd_started_at;
+        TickType_t cmd_budget = pdMS_TO_TICKS(HOSTED_WIFI_COMMAND_BUDGET_MS);
+        TickType_t cmd_remaining = cmd_elapsed >= cmd_budget ?
+                                   0 : cmd_budget - cmd_elapsed;
+
+        if (remaining > cmd_remaining)
+            remaining = cmd_remaining;
+    }
+    return remaining;
+}
+
+static bool hosted_wait_wifi_event_ack(const char *phase, TickType_t stop_started)
+{
+    TickType_t remaining = hosted_wifi_stop_remaining(stop_started);
+    TickType_t first_wait = pdMS_TO_TICKS(HOSTED_WIFI_EVENT_ACK_WARN_MS);
+
+    if (first_wait > remaining)
+        first_wait = remaining;
+    if (remaining && xSemaphoreTake(s_wifi_stop_ack, first_wait) == pdTRUE)
+        return true;
+
+    /* Congestion may delay a valid event. Wait through the remaining shared
+     * stop budget, without exceeding the host's 5-second command timeout. */
+    ESP_LOGW(TAG, "Wi-Fi %s event slow (elapsed=%"PRIu32" ms, count=%"PRIu32")",
+             phase, (uint32_t)(xTaskGetTickCount() - stop_started) *
+                    portTICK_PERIOD_MS, ++s_wifi_slow_ack_count);
+    remaining = hosted_wifi_stop_remaining(stop_started);
+    if (remaining && xSemaphoreTake(s_wifi_stop_ack, remaining) == pdTRUE) {
+        ESP_LOGW(TAG, "Wi-Fi %s event recovered after %"PRIu32" ms total",
+                 phase, (uint32_t)(xTaskGetTickCount() - stop_started) *
+                        portTICK_PERIOD_MS);
+        return true;
+    }
+    ESP_LOGE(TAG, "Wi-Fi %s event unresolved (stop budget %u ms)",
+             phase, HOSTED_WIFI_STOP_BUDGET_MS);
+    return false;
+}
+
+static void hosted_scan_fence_handler(void *arg, esp_event_base_t base,
+                                     int32_t id, void *data)
+{
+    if (base != HOSTED_SCAN_LIFECYCLE_EVENT ||
+        id != HOSTED_SCAN_EVENT_FENCE)
+        return;
+
+    portENTER_CRITICAL(&s_scan_lock);
+    s_scan_drain_pending = false;
+    portEXIT_CRITICAL(&s_scan_lock);
+    if (s_wifi_stop_ack)
+        xSemaphoreGive(s_wifi_stop_ack);
+    ESP_LOGD(TAG, "Wi-Fi stop event-loop fence processed");
+}
+
+/* An aborted scan can post SCAN_DONE after stop returns. Either consume
+ * that completion or pass the event-loop stop fence before a new scan. */
+static void hosted_scan_abort(void)
+{
+    bool had_scan;
+
+    portENTER_CRITICAL(&s_scan_lock);
+    had_scan = s_scan_in_progress;
+    if (had_scan) {
+        s_scan_in_progress = false;
+        s_scan_drain_pending = true;
+    }
+    portEXIT_CRITICAL(&s_scan_lock);
+    if (had_scan) {
+        esp_err_t ret = esp_wifi_scan_stop();
+        if (ret != ESP_OK)
+            ESP_LOGW(TAG, "scan abort ret=%d; waiting for any outstanding completion", ret);
+    }
+}
+
+bool esp_hosted_wifi_channel_transition_active(void)
+{
+    return !!association_ongoing || s_scan_in_progress;
+}
 static uint16_t s_mgmt_tx_seq;
 static uint8_t s_mgmt_tx_da[ETH_ALEN];
 static bool s_mgmt_tx_token_valid;
@@ -641,10 +753,49 @@ static void mgmt_tx_fail_pending(void)
 
 static esp_err_t hosted_wifi_stop(void)
 {
-    esp_err_t ret = esp_wifi_stop();
+    esp_err_t ret;
+    wifi_mode_t previous_mode = WIFI_MODE_NULL;
+    bool expect_sta_stop;
+    TickType_t stop_started = xTaskGetTickCount();
 
-    if (ret == ESP_OK) {
+    /* The STA_STOP notification is asynchronous. Wait for it explicitly
+     * before the event-loop fence, or it could appear AFTER the marker and
+     * invalidate the next association. This runs only in the command task. */
+    expect_sta_stop = s_wifi_started &&
+                      esp_wifi_get_mode(&previous_mode) == ESP_OK &&
+                      (previous_mode == WIFI_MODE_STA ||
+                       previous_mode == WIFI_MODE_APSTA);
+    if (s_wifi_stop_ack)
+        (void)xSemaphoreTake(s_wifi_stop_ack, 0);
+    s_sta_stop_ack_pending = expect_sta_stop;
+    s_wifi_stop_in_progress = true;
+    /* Capture the operating channel before Wi-Fi stop retires STA/AP. */
+    esp_hosted_monitor_snapshot_channel();
+    hosted_scan_abort();
+    ret = esp_wifi_stop();
+
+    if (ret == ESP_OK || ret == ESP_ERR_WIFI_NOT_STARTED ||
+        ret == ESP_ERR_WIFI_NOT_INIT) {
+        /* NOT_STARTED and NOT_INIT both mean there is no running radio.
+         * Reconcile cached state so INIT never skips a necessary start. */
         s_wifi_started = false;
+        /* Stop retires all old STA/AP roles synchronously. Do not depend on
+         * delayed DISCONNECTED/STOP events to clear pre-stop connection
+         * state during AP reconfiguration or monitor restoration. */
+        association_ongoing = 0;
+        station_connected = 0;
+        station_authorized = 0;
+        softap_started = 0;
+        sta_init_flag = 0;
+        s_assoc_generation = 0;
+        memset(s_assoc_bssid, 0, MAC_ADDR_LEN);
+        s_assoc_control_port = 0;
+        s_assoc_is_reassoc = 0;
+        s_auth_generation = 0;
+        s_conn_generation = 0;
+        s_disconnect_generation = 0;
+        /* A pending canceled SCAN_DONE is quarantined until the event
+         * handler consumes it, including across an immediate restart. */
         /* esp_wifi_stop() cancels in-flight TX and often never invokes the
          * TX-done callback. Fail the host waiter and free the slot. */
         s_mgmt_cb_owned = false;
@@ -652,6 +803,56 @@ static esp_err_t hosted_wifi_stop(void)
     } else {
         ESP_LOGE(TAG, "esp_wifi_stop failed ret=%d", ret);
     }
+
+    /*
+     * Do not allow a newer scan/association until old Wi-Fi event callbacks
+     * have drained. Waiting for the marker HANDLER (not only enqueue) makes
+     * the stop/start barrier synchronous. esp_wifi_stop() must quiesce the
+     * producer first; absence of a confirmed fence is an unsafe state.
+     */
+    if (!s_wifi_stop_ack) {
+        ESP_LOGE(TAG, "Wi-Fi event fence not initialized, restarting");
+        esp_restart();
+        return ESP_FAIL;
+    }
+    if (expect_sta_stop && ret == ESP_OK &&
+        !hosted_wait_wifi_event_ack("STA_STOP", stop_started)) {
+        ESP_LOGE(TAG, "STA_STOP was not dispatched before restart; restarting");
+        esp_restart();
+        return ESP_FAIL;
+    }
+    /* No STA_STOP event is expected if stopping failed or mode was AP-only. */
+    s_sta_stop_ack_pending = false;
+    (void)xSemaphoreTake(s_wifi_stop_ack, 0);
+    TickType_t post_wait = pdMS_TO_TICKS(HOSTED_WIFI_FENCE_POST_WAIT_MS);
+    TickType_t remaining = hosted_wifi_stop_remaining(stop_started);
+    esp_err_t fence_ret;
+
+    if (post_wait > remaining)
+        post_wait = remaining;
+    fence_ret = remaining ? esp_event_post(HOSTED_SCAN_LIFECYCLE_EVENT,
+                                          HOSTED_SCAN_EVENT_FENCE,
+                                          NULL, 0, post_wait) : ESP_ERR_TIMEOUT;
+    if (fence_ret != ESP_OK) {
+        /* Retry only when no marker was queued. Never enqueue a duplicate
+         * fence after a successful post. Share the same stop deadline. */
+        ESP_LOGW(TAG, "Wi-Fi event fence enqueue delayed (%d); retrying", fence_ret);
+        remaining = hosted_wifi_stop_remaining(stop_started);
+        post_wait = pdMS_TO_TICKS(HOSTED_WIFI_FENCE_POST_WAIT_MS);
+        if (post_wait > remaining)
+            post_wait = remaining;
+        if (remaining)
+            fence_ret = esp_event_post(HOSTED_SCAN_LIFECYCLE_EVENT,
+                                       HOSTED_SCAN_EVENT_FENCE,
+                                       NULL, 0, post_wait);
+    }
+    if (fence_ret != ESP_OK ||
+        !hosted_wait_wifi_event_ack("fence", stop_started)) {
+        ESP_LOGE(TAG, "Wi-Fi event fence failure (%d); restarting", fence_ret);
+        esp_restart();
+        return ESP_FAIL;
+    }
+    s_wifi_stop_in_progress = false;
     return ret;
 }
 
@@ -666,6 +867,12 @@ static esp_err_t hosted_wifi_start(void)
         ret = mgmt_tx_ensure_cb();
         if (ret) {
             ESP_LOGE(TAG, "mgmt tx cb install after wifi_start ret=%d", ret);
+            (void)hosted_wifi_stop();
+            return ret;
+        }
+        ret = esp_hosted_monitor_restore();
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "monitor restore after wifi_start ret=%d", ret);
             (void)hosted_wifi_stop();
             return ret;
         }
@@ -1277,11 +1484,20 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
     switch (event_id) {
 
     case WIFI_EVENT_STA_START:
+        /* START may be dispatched before esp_wifi_start() returns. */
+        if (s_wifi_stop_in_progress) {
+            ESP_LOGD(TAG, "ignoring STA_START during stop");
+            break;
+        }
         ESP_LOGI(TAG, "station started");
         sta_init_flag = 1;
         break;
 
     case WIFI_EVENT_STA_CONNECTED:
+        if (s_wifi_stop_in_progress || !s_wifi_started) {
+            ESP_LOGD(TAG, "ignoring STA_CONNECTED from stopped incarnation");
+            break;
+        }
         ESP_LOGI(TAG, "Wifi Station Connected event!! \n");
         association_ongoing = 0;
         s_assoc_generation = 0;
@@ -1303,6 +1519,10 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
         break;
 
     case WIFI_EVENT_STA_DISCONNECTED:
+        if (s_wifi_stop_in_progress || !s_wifi_started) {
+            ESP_LOGD(TAG, "ignoring STA_DISCONNECTED from stopped incarnation");
+            break;
+        }
         if (!event_data) {
             ESP_LOGE(TAG, "%s:%u NULL data", __func__, __LINE__);
             return;
@@ -1329,23 +1549,85 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
         break;
 
     case WIFI_EVENT_SCAN_DONE:
-        ESP_LOGI(TAG, "wifi scanning done");
-        handle_scan_event();
+        {
+            bool complete_active = false;
+            bool drained_old = false;
+
+            esp_err_t clear_ret;
+
+            /* The blocking authentication lookup owns its AP-record list.
+             * On customized Wi-Fi archives, an unexpected SCAN_DONE from
+             * that lookup must not clear records before AUTH consumes them.
+             * Normal explicit scans are rejected while AUTH is blocking. */
+            if (s_auth_scan_in_progress) {
+                ESP_LOGW(TAG, "ignoring SCAN_DONE while AUTH owns AP records");
+                break;
+            }
+
+            /* Hosted delivers scan results as captured management frames,
+             * not through the IDF AP-record cache. The blocking AUTH scan
+             * consumes its own records and does not emit SCAN_DONE. Drain
+             * explicit scan records before releasing ownership: otherwise a
+             * new scan can replace the list before we free the old one. */
+            clear_ret = esp_wifi_clear_ap_list();
+            if (clear_ret != ESP_OK &&
+                clear_ret != ESP_ERR_WIFI_NOT_STARTED &&
+                clear_ret != ESP_ERR_WIFI_NOT_INIT)
+                ESP_LOGW(TAG, "scan AP-list cleanup returned %d", clear_ret);
+
+            portENTER_CRITICAL(&s_scan_lock);
+            if (s_scan_drain_pending) {
+                s_scan_drain_pending = false;
+                drained_old = true;
+            } else if (s_scan_in_progress) {
+                s_scan_in_progress = false;
+                complete_active = true;
+            }
+            portEXIT_CRITICAL(&s_scan_lock);
+            if (complete_active) {
+                ESP_LOGI(TAG, "wifi scanning done");
+                handle_scan_event();
+            } else if (drained_old) {
+                ESP_LOGI(TAG, "retired scan completion drained");
+            } else {
+                ESP_LOGD(TAG, "ignoring scan-done with no active owner");
+            }
+        }
         break;
 
     case WIFI_EVENT_AP_START:
+        if (s_wifi_stop_in_progress) {
+            ESP_LOGD(TAG, "ignoring AP_START during stop");
+            break;
+        }
         ESP_LOGI(TAG, "softap started");
         softap_started = 1;
         break;
 
     case WIFI_EVENT_AP_STOP:
+        if (s_wifi_started && !s_wifi_stop_in_progress) {
+            ESP_LOGW(TAG, "ignoring delayed AP_STOP after restart");
+            break;
+        }
         ESP_LOGI(TAG, "softap stopped");
         softap_started = 0;
         break;
 
     case WIFI_EVENT_STA_STOP:
+        if (s_sta_stop_ack_pending) {
+            s_sta_stop_ack_pending = false;
+            if (s_wifi_stop_ack)
+                xSemaphoreGive(s_wifi_stop_ack);
+        }
+        if (s_wifi_started && !s_wifi_stop_in_progress) {
+            /* An older STOP must not invalidate the next session's auth. */
+            ESP_LOGW(TAG, "ignoring delayed STA_STOP after restart");
+            break;
+        }
         ESP_LOGI(TAG, "Station stop");
         sta_init_flag = 0;
+        /* Do not clear drain_pending here: an old SCAN_DONE may still
+         * be queued after the stop event. Only SCAN_DONE retires it. */
         association_ongoing = 0;
         s_assoc_generation = 0;
         memset(s_assoc_bssid, 0, MAC_ADDR_LEN);
@@ -1362,11 +1644,22 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
 void esp_create_wifi_event_loop(void)
 {
     ESP_ERROR_CHECK(esp_event_loop_create_default());
+    s_wifi_stop_ack = xSemaphoreCreateBinary();
+    if (!s_wifi_stop_ack) {
+        ESP_LOGE(TAG, "unable to allocate Wi-Fi stop fence semaphore");
+        esp_restart();
+        return;
+    }
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
                                                         ESP_EVENT_ANY_ID,
                                                         &wifi_event_handler,
                                                         NULL,
                                                         &instance_any_id));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(
+                    HOSTED_SCAN_LIFECYCLE_EVENT,
+                    HOSTED_SCAN_EVENT_FENCE,
+                    &hosted_scan_fence_handler, NULL,
+                    &s_scan_fence_instance));
 }
 
 static int sta_rx_auth(uint8_t type, uint8_t *frame, size_t len, uint8_t *sender,
@@ -1787,6 +2080,7 @@ int process_start_scan(uint8_t if_type, uint8_t *payload, uint16_t payload_len)
     uint8_t cmd_status = CMD_RESPONSE_SUCCESS;
     struct scan_request *scan_req;
     bool config_present = false;
+    wifi_mode_t current_mode = WIFI_MODE_NULL;
 
     if (!payload || payload_len < sizeof(*scan_req)) {
         ESP_LOGE(TAG, "SCAN_REJECT invalid_len=%u expected=%u", payload_len,
@@ -1795,6 +2089,25 @@ int process_start_scan(uint8_t if_type, uint8_t *payload, uint16_t payload_len)
     }
 
     scan_req = (struct scan_request *) payload;
+
+    /* Keep one explicit scan owner. A second scan can abort the first
+     * and deliver its completion asynchronously. */
+    if (s_scan_in_progress || s_scan_drain_pending)
+        return send_command_resp(if_type, CMD_SCAN_REQUEST,
+                                 CMD_RESPONSE_BUSY, NULL, 0);
+
+    /*
+     * A wildcard scan hops channels and would silently retune the single
+     * physical radio away from an active monitor interface.  While monitor
+     * capture is enabled, permit only an explicitly same-channel scan.
+     */
+    if (esp_hosted_monitor_is_enabled() &&
+        (!esp_hosted_monitor_channel_allowed(scan_req->channel, false))) {
+        ESP_LOGW(TAG, "SCAN_REJECT monitor channel=%u requested=%u",
+                 esp_hosted_monitor_channel(), scan_req->channel);
+        return send_command_resp(if_type, CMD_SCAN_REQUEST,
+                                 CMD_RESPONSE_BUSY, NULL, 0);
+    }
 
     if (strnlen(scan_req->ssid, sizeof(scan_req->ssid))) {
         params.ssid = malloc(sizeof(scan_req->ssid));
@@ -1828,13 +2141,31 @@ int process_start_scan(uint8_t if_type, uint8_t *payload, uint16_t payload_len)
         config_present = true;
     }
 
-    if (sta_init_flag || softap_started) {
+    /* START events are delivered asynchronously and may still be queued
+     * after esp_wifi_start() has succeeded. Use the synchronous lifecycle
+     * and configured mode; the scan API remains the final admission check. */
+    if (s_wifi_started && !s_wifi_stop_in_progress &&
+        esp_wifi_get_mode(&current_mode) == ESP_OK &&
+        current_mode != WIFI_MODE_NULL) {
         /* Register to receive probe response and beacon frames */
         type = (1 << WLAN_FC_STYPE_BEACON) | (1 << WLAN_FC_STYPE_PROBE_RESP) |
                (1 << WLAN_FC_STYPE_ASSOC_RESP) | (1 << WLAN_FC_STYPE_REASSOC_RESP);
         esp_wifi_register_mgmt_frame_internal(type, 0);
 
-        /* Trigger scan */
+        /* Publish scan ownership before starting async Wi-Fi work so an
+         * early SCAN_DONE cannot race a late flag write. */
+        portENTER_CRITICAL(&s_scan_lock);
+        if (s_scan_in_progress || s_scan_drain_pending) {
+            portEXIT_CRITICAL(&s_scan_lock);
+            if (params.ssid)
+                free(params.ssid);
+            if (params.bssid)
+                free(params.bssid);
+            return send_command_resp(if_type, CMD_SCAN_REQUEST,
+                                     CMD_RESPONSE_BUSY, NULL, 0);
+        }
+        s_scan_in_progress = true;
+        portEXIT_CRITICAL(&s_scan_lock);
         if (config_present) {
             ret = esp_wifi_scan_start(&params, false);
         } else {
@@ -1842,6 +2173,9 @@ int process_start_scan(uint8_t if_type, uint8_t *payload, uint16_t payload_len)
         }
 
         if (ret) {
+            portENTER_CRITICAL(&s_scan_lock);
+            s_scan_in_progress = false;
+            portEXIT_CRITICAL(&s_scan_lock);
             ESP_LOGI(TAG, "Scan failed ret=[0x%x]\n", ret);
             cmd_status = CMD_RESPONSE_FAIL;
 
@@ -1849,7 +2183,7 @@ int process_start_scan(uint8_t if_type, uint8_t *payload, uint16_t payload_len)
             esp_wifi_register_mgmt_frame_internal(0, 0);
         }
     } else {
-        ESP_LOGI(TAG, "Scan not permitted as WiFi is not yet up");
+        ESP_LOGI(TAG, "Scan not permitted: Wi-Fi not started or mode NULL");
         cmd_status = CMD_RESPONSE_FAIL;
     }
 
@@ -2363,6 +2697,13 @@ int process_auth_request(uint8_t if_type, uint8_t *payload, uint16_t payload_len
     }
 
     cmd_auth = (struct cmd_sta_auth *) payload;
+    if (esp_hosted_monitor_is_enabled() &&
+        (!esp_hosted_monitor_channel_allowed(cmd_auth->channel, true))) {
+        ESP_LOGW(TAG, "AUTH_REJECT monitor channel=%u requested=%u",
+                 esp_hosted_monitor_channel(), cmd_auth->channel);
+        return send_command_resp(if_type, CMD_STA_AUTH,
+                                 CMD_RESPONSE_BUSY, NULL, 0);
+    }
     if (cmd_auth->key_len > sizeof(cmd_auth->key) ||
         !cmd_flex_len_valid(payload_len,
                             offsetof(struct cmd_sta_auth, auth_data),
@@ -2439,6 +2780,11 @@ int process_auth_request(uint8_t if_type, uint8_t *payload, uint16_t payload_len
     } else {
         wifi_scan_config_t params = {0};
 
+        if (s_scan_in_progress || s_scan_drain_pending) {
+            ESP_LOGW(TAG, "AUTH lookup blocked by explicit scan ownership");
+            cmd_status = CMD_RESPONSE_BUSY;
+            goto send_resp;
+        }
         params.bssid = malloc(sizeof(cmd_auth->bssid));
         if (!params.bssid) {
             ESP_LOGE(TAG, "AUTH_REJECT BSSID allocation failed");
@@ -2455,12 +2801,26 @@ int process_auth_request(uint8_t if_type, uint8_t *payload, uint16_t payload_len
             params.channel = cmd_auth->channel;
         }
 
-        esp_wifi_scan_start(&params, true);
+        s_auth_scan_in_progress = true;
+        ret = esp_wifi_scan_start(&params, true);
 
         free(params.bssid);
+        if (ret != ESP_OK) {
+            s_auth_scan_in_progress = false;
+            ESP_LOGW(TAG, "AUTH lookup scan failed: %d", ret);
+            (void)esp_wifi_clear_ap_list();
+            cmd_status = CMD_RESPONSE_FAIL;
+            goto send_resp;
+        }
         ret = esp_wifi_scan_get_ap_records(&number, ap_info);
-        if (ret) {
-            ESP_LOGI(TAG, "Err: esp_wifi_scan_get_ap_records: %d\n", ret);
+        s_auth_scan_in_progress = false;
+        if (ret != ESP_OK) {
+            /* On failure get_ap_records() might not release the cached AP
+             * list; do not accumulate records on failed authentication. */
+            ESP_LOGW(TAG, "AUTH scan records unavailable: %d", ret);
+            (void)esp_wifi_clear_ap_list();
+            cmd_status = CMD_RESPONSE_FAIL;
+            goto send_resp;
         }
 
         /* Register the Management frames */
@@ -2774,6 +3134,13 @@ int process_sta_connect(uint8_t if_type, uint8_t *payload, uint16_t payload_len)
         return send_command_resp(if_type, CMD_STA_CONNECT, CMD_RESPONSE_INVALID, NULL, 0);
     }
     cmd_connect = (struct cmd_sta_connect *) payload;
+    if (esp_hosted_monitor_is_enabled() &&
+        (!esp_hosted_monitor_channel_allowed(cmd_connect->channel, true))) {
+        ESP_LOGW(TAG, "CONNECT_REJECT monitor channel=%u requested=%u",
+                 esp_hosted_monitor_channel(), cmd_connect->channel);
+        return send_command_resp(if_type, CMD_STA_CONNECT,
+                                 CMD_RESPONSE_BUSY, NULL, 0);
+    }
     if (!cmd_flex_len_valid(payload_len,
                             offsetof(struct cmd_sta_connect, assoc_ie),
                             cmd_connect->assoc_ie_len)) {
@@ -2844,21 +3211,42 @@ int process_deinit_interface(uint8_t if_type, uint8_t *payload, uint16_t payload
 
     hosted_mgmt_fail_pending();
     wifi_mode_t wifi_mode = {0};
+    wifi_ap_record_t associated_ap = {0};
+    bool monitor_sta_idle = false;
     uint16_t cmd_status = CMD_RESPONSE_SUCCESS;
 
+    /*
+     * When a monitor VIF owns the shared radio, taking down an idle STA
+     * netdev must not stop and re-start that radio. In particular a
+     * monitor-only STA baseline has no associated station or AP role to
+     * retire. Leave the stronger stop/fence/rebuild path in place for an
+     * association, an in-flight transition, or AP teardown.
+     *
+     * Snapshot BEFORE esp_wifi_disconnect() and before retiring state;
+     * otherwise a previously associated STA can be misclassified as idle.
+     */
+    if (if_type == ESP_STA_IF && esp_hosted_monitor_is_enabled() &&
+        s_wifi_started && !s_wifi_stop_in_progress &&
+        !association_ongoing && !s_scan_in_progress &&
+        !s_scan_drain_pending && !s_auth_scan_in_progress &&
+        esp_wifi_get_mode(&wifi_mode) == ESP_OK &&
+        wifi_mode == WIFI_MODE_STA &&
+        esp_wifi_sta_get_ap_info(&associated_ap) != ESP_OK)
+        monitor_sta_idle = true;
+
+    /* Once disconnect runs, the connected STA's operating channel may no
+     * longer be observable. Save it before releasing channel ownership. */
+    esp_hosted_monitor_snapshot_channel();
     if (if_type == ESP_STA_IF) {
         if (sta_init_flag && esp_wifi_get_mode(&wifi_mode) == 0) {
             esp_wifi_deauthenticate_internal(WIFI_REASON_AUTH_LEAVE);
         }
         esp_wifi_disconnect();
     }
-    esp_wifi_scan_stop();
-    ret = hosted_wifi_stop();
-    if (ret != ESP_OK && ret != ESP_ERR_WIFI_NOT_INIT && ret != ESP_ERR_WIFI_NOT_STARTED) {
-        ESP_LOGE(TAG, "hosted_wifi_stop failed ret=%d, forcing restart", ret);
-        esp_restart();
-    }
-
+    /* The old association must be retired before hosted_wifi_start()
+     * invokes monitor_restore(), otherwise the transition guard rejects
+     * monitor restoration and can escalate a clean close to esp_restart().
+     * Delayed old callbacks are additionally gated by the new live session. */
     s_assoc_generation = 0;
     memset(s_assoc_bssid, 0, MAC_ADDR_LEN);
     s_assoc_control_port = 0;
@@ -2867,22 +3255,79 @@ int process_deinit_interface(uint8_t if_type, uint8_t *payload, uint16_t payload
     s_conn_generation = 0;
     s_disconnect_generation = 0;
     association_ongoing = 0;
+    station_connected = 0;
     station_authorized = 0;
+
+    if (!esp_hosted_monitor_is_enabled()) {
+        ret = hosted_wifi_stop();
+        if (ret != ESP_OK && ret != ESP_ERR_WIFI_NOT_INIT &&
+            ret != ESP_ERR_WIFI_NOT_STARTED) {
+            ESP_LOGE(TAG, "hosted_wifi_stop failed ret=%d, forcing restart", ret);
+            esp_restart();
+        }
+    } else if (monitor_sta_idle) {
+        /* No associated STA/AP exists to tear down. The monitor interface
+         * remains live on the already-started STA-mode radio; a stop/start
+         * here only risks losing the monitor and racing stale Wi-Fi events.
+         * Do not alter s_wifi_started or promiscuous/channel ownership. */
+        ESP_LOGI(TAG, "MONITOR_STA_IDLE_TEARDOWN: preserving active monitor radio");
+    } else {
+        ESP_LOGI(TAG, "MONITOR_STA_TEARDOWN_REBUILD: if=%u mode=%u assoc=%u scan=%u drain=%u auth=%u",
+                 if_type, (unsigned)wifi_mode, !!association_ongoing,
+                 !!s_scan_in_progress, !!s_scan_drain_pending,
+                 !!s_auth_scan_in_progress);
+        /*
+         * A normal WLAN teardown must still remove its STA/AP role.  Keeping
+         * the current AP/APSTA mode alive merely because monitor is using the
+         * radio leaves stale beacons/association state behind.  Rebuild the
+         * shared radio into the same STA-mode baseline used by monitor-only
+         * bring-up, then hosted_wifi_start() restores promiscuous capture.
+         */
+        ret = hosted_wifi_stop();
+        if (ret != ESP_OK && ret != ESP_ERR_WIFI_NOT_INIT &&
+            ret != ESP_ERR_WIFI_NOT_STARTED) {
+            ESP_LOGE(TAG, "monitor-preserving wifi stop failed ret=%d, forcing restart", ret);
+            esp_restart();
+        }
+        ESP_GOTO_ON_ERROR(esp_wifi_set_mac(WIFI_IF_AP, dummy_mac2),
+                          monitor_rebuild_failed, TAG,
+                          "monitor-preserving AP MAC reset failed");
+        ESP_GOTO_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_STA),
+                          monitor_rebuild_failed, TAG,
+                          "monitor-preserving STA mode failed");
+        ESP_GOTO_ON_ERROR(esp_wifi_set_mac(WIFI_IF_STA, dev_mac),
+                          monitor_rebuild_failed, TAG,
+                          "monitor-preserving STA MAC restore failed");
+        ESP_GOTO_ON_ERROR(hosted_wifi_start(), monitor_rebuild_failed, TAG,
+                          "monitor-preserving wifi restart failed");
+        ESP_LOGI(TAG, "Normal WLAN torn down; Wi-Fi kept in monitor-only baseline");
+    }
 
     ret = send_command_resp(if_type, CMD_DEINIT_INTERFACE, cmd_status, NULL, 0);
 
     return ret;
+
+monitor_rebuild_failed:
+    ESP_LOGE(TAG, "Monitor-preserving WLAN teardown failed ret=%d, forcing restart", ret);
+    esp_restart();
+    return ESP_FAIL;
 }
 
 int process_init_interface(uint8_t if_type, uint8_t *payload, uint16_t payload_len)
 {
     esp_err_t ret = ESP_OK;
+    wifi_mode_t current_mode = WIFI_MODE_NULL;
     uint16_t cmd_status = CMD_RESPONSE_FAIL;
 
-    /* s_wifi_started is updated synchronously by hosted_wifi_start/stop.
-     * sta_init_flag / softap_started lag until WIFI_EVENT_*_START/STOP, so
-     * they must not decide whether start is required after a fast DEINIT. */
-    if (!s_wifi_started || (if_type == ESP_AP_IF && !softap_started)) {
+    /* An AP_START event can arrive after the mode has been changed back
+     * to STA. Use the synchronously configured Wi-Fi mode instead of the
+     * event-derived softap_started flag for this transition. */
+    ret = esp_wifi_get_mode(&current_mode);
+    if (ret != ESP_OK)
+        goto done;
+    if (!s_wifi_started ||
+        (if_type == ESP_AP_IF &&
+         current_mode != WIFI_MODE_AP && current_mode != WIFI_MODE_APSTA)) {
 
         /* Use same MAC for AP and STA */
         esp_read_mac(dev_mac, ESP_MAC_WIFI_STA);
@@ -3524,6 +3969,13 @@ int process_set_ap_config(uint8_t if_type, uint8_t *payload, uint16_t payload_le
     }
 
     ap_config = (struct cmd_ap_config *) payload;
+    if (esp_hosted_monitor_is_enabled() &&
+        (!esp_hosted_monitor_channel_allowed(ap_config->ap_config.channel, true))) {
+        ESP_LOGW(TAG, "AP_CONFIG_REJECT monitor channel=%u requested=%u",
+                 esp_hosted_monitor_channel(), ap_config->ap_config.channel);
+        cmd_status = CMD_RESPONSE_BUSY;
+        goto send_resp;
+    }
     if (ap_config->ap_config.ssid_len > sizeof(ap_config->ap_config.ssid)) {
         ESP_LOGE(TAG, "AP config invalid SSID length=%u max=%u",
                  ap_config->ap_config.ssid_len,
@@ -3920,6 +4372,38 @@ send_resp:
     return send_command_resp(if_type, CMD_AP_STATION, cmd_status, NULL, 0);
 }
 
+int process_monitor_config(uint8_t if_type, uint8_t *payload, uint16_t payload_len)
+{
+    struct cmd_monitor_config *cfg;
+    uint8_t status = CMD_RESPONSE_FAIL;
+    esp_err_t ret;
+
+    if (if_type != ESP_MONITOR_IF || !payload ||
+        payload_len < sizeof(struct cmd_monitor_config)) {
+        return send_command_resp(if_type, CMD_MONITOR_CONFIG,
+                                 CMD_RESPONSE_INVALID, NULL, 0);
+    }
+
+    cfg = (struct cmd_monitor_config *)payload;
+    if (cfg->enable > 1)
+        return send_command_resp(if_type, CMD_MONITOR_CONFIG,
+                                 CMD_RESPONSE_INVALID, NULL, 0);
+
+    ESP_LOGI(TAG, "MONITOR_CONFIG_CMD code=%u seq=%u enable=%u channel=%u if=%u",
+             CMD_MONITOR_CONFIG, active_cmd_seq, cfg->enable, cfg->channel, if_type);
+    ret = esp_hosted_monitor_config(cfg->enable != 0, cfg->channel);
+    ESP_LOGI(TAG, "MONITOR_CONFIG_DONE code=%u seq=%u ret=%d",
+             CMD_MONITOR_CONFIG, active_cmd_seq, ret);
+    if (ret == ESP_OK)
+        status = CMD_RESPONSE_SUCCESS;
+    else if (ret == ESP_ERR_INVALID_ARG)
+        status = CMD_RESPONSE_INVALID;
+    else if (ret == ESP_ERR_INVALID_STATE)
+        status = CMD_RESPONSE_BUSY;
+
+    return send_command_resp(if_type, CMD_MONITOR_CONFIG, status, NULL, 0);
+}
+
 typedef int (*cmd_handler_fn)(uint8_t if_type, uint8_t *payload, uint16_t payload_len);
 
 /* A pre-boot SPI host may not have an initialized Wi-Fi command interface.
@@ -3984,12 +4468,15 @@ static const struct esp_cmd_entry s_cmd_table[] = {
     { CMD_SET_RADIO_SERVICE,  sizeof(struct cmd_radio_service),       process_radio_service,      "SET_RADIO_SERVICE" },
     { CMD_GET_RADIO_SERVICE,  sizeof(struct command_header),          process_radio_service,      "GET_RADIO_SERVICE" },
     { CMD_HOST_REBOOT,        sizeof(struct command_header),          process_host_reboot,         "HOST_REBOOT" },
+    { CMD_MONITOR_CONFIG,       sizeof(struct cmd_monitor_config),      process_monitor_config,      "MONITOR_CONFIG" },
 };
 
 int esp_cmd_dispatch(uint8_t if_type, uint8_t *payload, uint16_t payload_len)
 {
     struct command_header *header;
     const struct esp_cmd_entry *entry = NULL;
+    TickType_t handler_ticks;
+    int result;
     size_t i;
 
     if (!payload || payload_len < sizeof(*header)) {
@@ -4025,5 +4512,17 @@ int esp_cmd_dispatch(uint8_t if_type, uint8_t *payload, uint16_t payload_len)
     ESP_LOGD(TAG, "CMD_RX: %s code=%u seq=%u len=%u if=%u",
              entry->name, header->cmd_code, active_cmd_seq, payload_len, if_type);
 
-    return entry->handler(if_type, payload, payload_len);
+    /* The firmware dispatcher serializes host commands. Track the full
+     * request lifetime, not just an individual Wi-Fi stop: configuration,
+     * restart and the command response must fit the Linux timeout. */
+    s_cmd_started_at = xTaskGetTickCount();
+    s_cmd_in_progress = true;
+    result = entry->handler(if_type, payload, payload_len);
+    handler_ticks = xTaskGetTickCount() - s_cmd_started_at;
+    s_cmd_in_progress = false;
+    if (handler_ticks >= pdMS_TO_TICKS(HOSTED_WIFI_STOP_BUDGET_MS))
+        ESP_LOGW(TAG, "CMD_LATENCY code=%u seq=%u elapsed=%"PRIu32" ms",
+                 entry->cmd_code, active_cmd_seq,
+                 (uint32_t)handler_ticks * portTICK_PERIOD_MS);
+    return result;
 }

@@ -29,6 +29,32 @@ endif()
 
 register_component()
 
+# Hosted firmware calls private 802.11 MLME/AP/mgmt APIs provided by the
+# project-owned Wi-Fi archives in esp/esp_driver/lib, NOT the stock ESP-IDF
+# prebuilt archives. Directly bind all ESP-IDF imported Wi-Fi archive targets
+# to that immutable source-tree copy: a concurrent CI job may reset or replace
+# a shared ESP-IDF checkout's components/esp_wifi/lib directory at any time.
+# Never silently link the stock blobs or replace missing APIs with stubs.
+idf_build_get_property(_hosted_wifi_target IDF_TARGET)
+if(CONFIG_ESP_HOST_WIFI_ENABLED)
+    set(_hosted_wifi_target "${CONFIG_ESP_WIFI_CONTROLLER_TARGET}_host")
+endif()
+get_filename_component(_hosted_wifi_lib_dir
+    "${CMAKE_CURRENT_LIST_DIR}/../../lib/${_hosted_wifi_target}" ABSOLUTE)
+foreach(_blob core espnow mesh net80211 pp smartconfig wapi target)
+    if(TARGET esp_wifi_${_blob})
+        set(_archive "${_hosted_wifi_lib_dir}/lib${_blob}.a")
+        if(NOT EXISTS "${_archive}")
+            message(FATAL_ERROR "ESP-Hosted Wi-Fi archive missing: ${_archive}")
+        endif()
+        set_property(TARGET esp_wifi_${_blob} PROPERTY IMPORTED_LOCATION "${_archive}")
+        message(STATUS "ESP-Hosted Wi-Fi archive pinned: ${_blob} -> ${_archive}")
+    endif()
+endforeach()
+if(CONFIG_ESP_WIFI_ENABLED AND NOT TARGET esp_wifi_net80211)
+    message(FATAL_ERROR "ESP-IDF Wi-Fi net80211 imported target unavailable")
+endif()
+
 target_compile_definitions(${COMPONENT_LIB} PRIVATE)
 
 # Add directory of protocomm_priv.h to include paths

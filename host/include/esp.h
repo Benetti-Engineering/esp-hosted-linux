@@ -57,6 +57,7 @@ enum chipset_type_e {
 #define ESP_PAYLOAD_HEADER      8
 struct esp_private;
 struct esp_adapter;
+struct esp_monitor_device;
 
 #define ACQUIRE_LOCK            1
 #define LOCK_ALREADY_ACQUIRED   0
@@ -140,6 +141,18 @@ struct esp_adapter {
 	/* Private for each interface */
 	struct esp_wifi_device  *priv[ESP_MAX_INTERFACE];
 	struct hci_dev          *hcidev;
+	struct esp_monitor_device *monitor;
+	bool                    monitor_present;
+	bool                    monitor_up;
+	uint8_t                 monitor_channel;	/* selected channel, not RX observation */
+	uint8_t                 monitor_rx_channel;	/* most recent captured frame */
+	char                    monitor_name[IFNAMSIZ];
+	u64                     monitor_rx_packets;	/* accepted by network stack */
+	u64                     monitor_rx_bytes;
+	u64                     monitor_rx_submitted;	/* submitted to netif_rx */
+	u64                     monitor_rx_stack_drops;
+	u64                     monitor_rx_drops;
+	u64                     monitor_rx_malformed;
 
 	struct workqueue_struct *if_rx_workqueue;
 	struct work_struct      if_rx_work;
@@ -190,6 +203,12 @@ struct esp_adapter {
 struct esp_device {
 	struct device           *dev;
 	struct wiphy            *wiphy;
+	struct esp_adapter      *adapter;
+};
+
+struct esp_monitor_device {
+	struct wireless_dev     wdev;
+	struct net_device       *ndev;
 	struct esp_adapter      *adapter;
 };
 

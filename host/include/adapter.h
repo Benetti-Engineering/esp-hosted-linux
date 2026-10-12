@@ -75,6 +75,7 @@ enum ESP_INTERFACE_TYPE {
 	ESP_TEST_IF,
 	/* Stack-agnostic 802.15.4 RCP byte stream (Spinel/HDLC). */
 	ESP_RCP_IF,
+	ESP_MONITOR_IF,
 	ESP_MAX_IF,
 };
 
@@ -94,6 +95,7 @@ enum ESP_PACKET_TYPE {
 	PACKET_TYPE_EVENT,
 	PACKET_TYPE_EAPOL,
 	PACKET_TYPE_RCP_SESSION,
+	PACKET_TYPE_MONITOR,
 };
 
 #define ESP_RCP_SESSION_VERSION         1
@@ -136,6 +138,7 @@ enum ESP_CAPABILITIES {
 	ESP_WLAN_GCMP_SUPPORT = (1 << 8),
 	ESP_WLAN_USB_SUPPORT = (1 << 9),
 	ESP_BT_USB_SUPPORT = (1 << 10),
+	ESP_WLAN_MONITOR_SUPPORT = (1 << 11),
 };
 
 /* RCP remains an independently negotiated feature capability. */
@@ -209,6 +212,8 @@ enum COMMAND_CODE {
 	CMD_GET_RADIO_SERVICE = 34,
 	/* Pre-initialization, transport-level reboot with an explicit ACK. */
 	CMD_HOST_REBOOT = 35,
+	/* 36 reserved for AP station list; monitor is 37. */
+	CMD_MONITOR_CONFIG = 37,
 	CMD_MAX,
 };
 
@@ -248,6 +253,39 @@ struct cmd_radio_service {
 	uint64_t rcp_session_nonce;
 } __packed;
 
+#define ESP_MONITOR_META_VERSION 1
+
+#define ESP_MONITOR_FLAG_FCS_PRESENT (1U << 0)
+#define ESP_MONITOR_FLAG_FCS_BAD     (1U << 1)
+#define ESP_MONITOR_FLAG_SHORT_GI    (1U << 2)
+#define ESP_MONITOR_FLAG_HT          (1U << 3)
+#define ESP_MONITOR_FLAG_CCK         (1U << 4)
+
+struct cmd_monitor_config {
+	struct command_header header;
+	uint8_t enable;
+	uint8_t channel;
+	uint8_t secondary_channel;
+	uint8_t reserved;
+} __packed;
+
+/* Versioned little-endian metadata preceding each raw 802.11 monitor frame. */
+struct esp_monitor_meta_v1 {
+	uint8_t version;
+	uint8_t frame_type;
+	uint8_t channel;
+	int8_t rssi;
+	uint8_t rate;
+	uint8_t sig_mode;
+	uint8_t mcs;
+	uint8_t cwb;
+	uint8_t secondary_channel;
+	uint8_t antenna;
+	uint8_t flags;
+	uint8_t reserved;
+	uint16_t frame_len;
+	uint32_t timestamp_us;
+} __packed;
 
 struct cmd_ota_update_request {
 	struct command_header header;
