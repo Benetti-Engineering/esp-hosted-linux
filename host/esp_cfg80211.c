@@ -2153,7 +2153,24 @@ static int esp_change_ap_ies(struct esp_wifi_device *priv,
 		}
 	}
 
-	/* Execute updates sequentially with checked rollback on failure. */
+	/*
+	 * hostapd may repeat a beacon update after every association, often
+	 * omitting optional extra-IE slots. Avoid issuing redundant SET_IE/
+	 * UNSET_IE commands, particularly unsets of already-empty slots:
+	 * the firmware can reject an absent optional slot as invalid and turn a
+	 * successful association into an AP beacon-update failure.
+	 */
+	for (i = 0; i < 5; i++) {
+		if (!update[i])
+			continue;
+		if (priv->ap_ie_len[i] == new_len[i] &&
+		    (!new_len[i] ||
+		     (priv->ap_ie_buf[i] &&
+		      !memcmp(priv->ap_ie_buf[i], new_buf[i], new_len[i]))))
+			update[i] = false;
+	}
+
+	/* Execute changed updates sequentially with checked rollback on failure. */
 	for (i = 0; i < 5; i++) {
 		if (!update[i])
 			continue;
@@ -2523,11 +2540,77 @@ static int esp_cfg80211_change_station(struct wiphy *wiphy,
 		return -EINVAL;
 	}
 	if (priv->if_type == ESP_AP_IF) {
-		int ret = cfg80211_check_station_change(wiphy, params,
-							CFG80211_STA_AP_MLME_CLIENT);
-		if (ret)
-			return ret;
-		return cmd_add_station(priv, mac, params, true);
+		int ret;
+
+		/*
+		 * hostapd first assigns a newly associated peer to its default
+		 * BSS interface (VLAN ID 0).  This does not require any firmware
+		 * station modification.  A dedicated AP_VLAN netdev is not yet
+		 * supported; do not silently accept non-default VLAN isolation.
+		 * Keep station authorization changes on the normal firmware path.
+		 */
+		if (params->vlan && params->vlan != dev) {
+			esp_err("AP station VLAN rebind to a different netdev is unsupported\\n");
+			return -EOPNOTSUPP;
+		}
+		if (params->vlan && !params->sta_flags_mask &&
+		    !params->sta_modify_mask) {
+			esp_dbg("AP default-BSS station VLAN confirmed for "MACSTR"\\n",
+				MAC2STR(mac));
+			return 0;
+		}
+
+		/*
+		 * Hostapd sends SHORT_PREAMBLE/WME/MFP capability flags after
+		 * association, before the WPA four-way handshake.  The hardware
+		 * already knows the negotiated preamble/WMM state from the
+		 * association request; these are not commands to authorize data.
+		 * cfg80211_check_station_change(AP_MLME_CLIENT) rejects this
+		 * capability-only mask with -EOPNOTSUPP.  Only an explicit
+		 * AUTHORIZED transition is forwarded to the firmware.
+		 *
+		 * Do not silently claim PMF support: a positive MFP transition
+		 * requires the protected management TX/RX path to be qualified.
+		 */
+		{
+			const u32 authorized = BIT(NL80211_STA_FLAG_AUTHORIZED);
+			const u32 preamble = BIT(NL80211_STA_FLAG_SHORT_PREAMBLE);
+			const u32 wme = BIT(NL80211_STA_FLAG_WME);
+			const u32 mfp = BIT(NL80211_STA_FLAG_MFP);
+			struct station_parameters auth_only;
+
+			if (params->sta_flags_mask &
+			    ~(authorized | preamble | wme | mfp)) {
+				esp_err("AP unsupported station flag mask=0x%x\\n",
+					params->sta_flags_mask);
+				return -EOPNOTSUPP;
+			}
+			if ((params->sta_flags_mask & mfp) &&
+			    (params->sta_flags_set & mfp)) {
+				esp_err("AP MFP station transition not yet qualified\\n");
+				return -EOPNOTSUPP;
+			}
+			if (!(params->sta_flags_mask & authorized)) {
+				if (params->sta_modify_mask) {
+					esp_err("AP unsupported station modify mask=0x%x\\n",
+						params->sta_modify_mask);
+					return -EOPNOTSUPP;
+				}
+				return 0;
+			}
+
+			auth_only = *params;
+			auth_only.sta_flags_mask = authorized;
+			auth_only.sta_flags_set &= authorized;
+			ret = cfg80211_check_station_change(wiphy, &auth_only,
+						CFG80211_STA_AP_MLME_CLIENT);
+			if (ret) {
+				esp_err("AP station authorization rejected ret=%d set=0x%x\\n",
+					ret, auth_only.sta_flags_set);
+				return ret;
+			}
+			return cmd_add_station(priv, mac, &auth_only, true);
+		}
 	}
 
 	if (priv->if_type == ESP_STA_IF &&

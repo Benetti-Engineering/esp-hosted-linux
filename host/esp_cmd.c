@@ -2406,6 +2406,21 @@ int cmd_disconnect_request(struct esp_wifi_device *priv, u16 reason_code,
 	if (mac)
 		memcpy(cmd->mac, mac, ETH_ALEN);
 
+	/*
+	 * AP deauthentication deletes a firmware station node synchronously.
+	 * It has no STA MLME disconnect event or connection generation to
+	 * complete. Arming the STA timeout here previously rebooted a healthy
+	 * AP after a station disconnect (and destroyed its cfg80211 interface).
+	 */
+	if (priv->if_type == ESP_AP_IF) {
+		if (!mac) {
+			recycle_cmd_node(priv->adapter, cmd_node);
+			return -EOPNOTSUPP; /* all-stations deletion not yet supported */
+		}
+		queue_cmd_node(priv->adapter, cmd_node, ESP_CMD_DFLT_PRIO);
+		return wait_and_decode_cmd_resp(priv, cmd_node);
+	}
+
 	spin_lock_bh(&priv->bss_lock);
 	priv->local_disconnect_req = true;
 	priv->disconnect_cmd_seq = cmd_node->cmd_seq;
@@ -4094,6 +4109,9 @@ int cmd_add_station(struct esp_wifi_device *priv, const uint8_t *mac,
 	}
 #endif
 
+	esp_info("AP_STATION TX cmd=%s mask=0x%x set=0x%x modify=0x%x aid=%u\\n",
+		is_changed ? "CHANGE" : "ADD", sta->sta_flags_mask,
+		sta->sta_flags_set, sta->sta_modify_mask, sta->aid);
 	queue_cmd_node(priv->adapter, cmd_node, ESP_CMD_DFLT_PRIO);
 
 	RET_ON_FAIL(wait_and_decode_cmd_resp(priv, cmd_node));
