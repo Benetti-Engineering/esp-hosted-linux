@@ -7,6 +7,8 @@ param(
     [switch]$Help
 )
 
+Set-Location $PSScriptRoot
+
 
 function Apply-IdfPatchOnce {
     param([Parameter(Mandatory = $true)][string]$Patch)
@@ -50,6 +52,11 @@ function Show-Help {
 }
 
 if ($Help) { Show-Help }
+
+if ($Force -and $UpdateIdf) {
+    Write-Error "-f and -u cannot be used together."
+    exit 1
+}
 
 $envFile = ".env"
 if (-not (Test-Path $envFile)) {
@@ -122,19 +129,12 @@ if (-not (Test-Path $ESP_IDF_DIR)) {
     $ESP_IDF_PRESENT = $true
     $ESP_IDF_CORRECT = $true
 }
-
-# Handle -u (update-only)
-if ($UpdateIdf) {
+elseif ($UpdateIdf) {
     $response = Read-Host "WARNING: This will reset changes inside esp-idf only. Continue? [y/N]"
     if ($response -ne 'y') { Write-Host "Aborted."; exit 1 }
 
-    if (-not (Test-Path $ESP_IDF_DIR)) {
-        Write-Host "esp-idf not found. Cloning it now..."
-        git clone --branch $IDF_TAG --depth 100 https://github.com/espressif/esp-idf.git $ESP_IDF_DIR
-    }
-
     Push-Location $ESP_IDF_DIR
-    git fetch --depth 100 origin $IDF_TAG
+    git fetch --no-recurse-submodules --depth 100 origin $IDF_TAG
     git reset --hard $IDF_COMMIT
     git clean -fdx
     Write-Host "ESP hosted: applying IDF patches"
@@ -165,6 +165,6 @@ if (Test-Path $destRoot) {
     New-Item -ItemType Directory -Path $destRoot -Force | Out-Null
 }
 
-Copy-Item ".\lib\*" $destRoot -Recurse -Force -ErrorAction SilentlyContinue
+Copy-Item ".\lib\esp*" $destRoot -Recurse -Force -ErrorAction SilentlyContinue
 
 Write-Host "###### Setup Done ######"
