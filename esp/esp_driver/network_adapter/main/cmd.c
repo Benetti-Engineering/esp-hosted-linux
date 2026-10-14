@@ -2618,6 +2618,24 @@ int process_reg_get(uint8_t if_type, uint8_t *payload, uint16_t payload_len)
 }
 
 int ieee80211_delete_node(uint8_t *mac);
+
+static int wifi_deauth_ipc_fn(void *arg)
+{
+    uint32_t reason = (uint32_t)(uintptr_t)arg;
+    esp_wifi_deauthenticate_internal((uint8_t)reason);
+    return 0;
+}
+
+static int wifi_deauthenticate_sta(uint16_t reason)
+{
+    wifi_ipc_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.fn = wifi_deauth_ipc_fn;
+    cfg.arg = (void *)(uintptr_t)reason;
+    cfg.arg_size = 0;
+    return esp_wifi_ipc_internal(&cfg, true);
+}
+
 int process_disconnect(uint8_t if_type, uint8_t *payload, uint16_t payload_len)
 {
     struct cmd_disconnect *cmd;
@@ -2657,7 +2675,7 @@ int process_disconnect(uint8_t if_type, uint8_t *payload, uint16_t payload_len)
             s_assoc_control_port = 0;
             s_assoc_is_reassoc = 0;
             association_ongoing = 0;
-            esp_wifi_deauthenticate_internal(reason);
+            wifi_deauthenticate_sta(reason);
             status = CMD_RESPONSE_SUCCESS;
         }
     } else if (if_type == ESP_AP_IF) {
