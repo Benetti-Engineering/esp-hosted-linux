@@ -345,6 +345,8 @@ esp_err_t send_bootup_event_to_host(uint32_t cap, uint32_t ext_cap)
 
     /* RCP nonce is published only by CMD_SET_RADIO_SERVICE after activation. */
 
+    esp_hosted_add_boot_mac_tlv(&pos, &len);
+
     /* TLV - Slave RX Buffer Size */
     *pos = ESP_BOOTUP_RX_BUF_SIZE;        pos++; len++;
     *pos = 4;                             pos++; len++;

@@ -2827,6 +2827,9 @@ int esp_add_wiphy(struct esp_adapter *adapter)
 	//wiphy->features |= NL80211_CMD_PROBE_CLIENT;
 	wiphy->features |= NL80211_FEATURE_SK_TX_STATUS;
 
+	/* Optional immutable identity arrives in the firmware boot event. */
+	if (adapter->base_mac_present)
+		ether_addr_copy(wiphy->perm_addr, adapter->base_mac);
 	ret = wiphy_register(wiphy);
 	if (ret) {
 		esp_err("Failed to register wiphy: %d\n", ret);

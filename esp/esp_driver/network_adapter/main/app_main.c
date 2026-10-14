@@ -947,6 +947,27 @@ config_failed:
 
 uint8_t dev_mac[MAC_ADDR_LEN] = {0};
 
+/* The IDF-derived STA MAC is the configured base MAC on Wi-Fi SoCs. */
+void esp_hosted_add_boot_mac_tlv(uint8_t **pos, uint16_t *len)
+{
+    uint8_t mac[MAC_ADDR_LEN];
+    uint8_t *p;
+    const uint8_t count = CONFIG_ESP_MAC_UNIVERSAL_MAC_ADDRESSES;
+
+    if (esp_read_mac(mac, ESP_MAC_WIFI_STA) != ESP_OK || (mac[0] & 1) ||
+        (count != 1 && count != 2 && count != 4))
+        return;
+    p = *pos;
+    *p++ = ESP_BOOTUP_BASE_MAC_INFO;
+    *p++ = MAC_ADDR_LEN + 1;
+    memcpy(p, mac, MAC_ADDR_LEN);
+    p += MAC_ADDR_LEN;
+    *p++ = count;
+    *pos = p;
+    *len += MAC_ADDR_LEN + 3;
+}
+
+
 #if CONFIG_ESP_SDIO_HOST_INTERFACE
 extern void wake_host();
 #endif

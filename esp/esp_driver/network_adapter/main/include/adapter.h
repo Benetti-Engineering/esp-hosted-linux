@@ -173,6 +173,8 @@ enum ESP_BOOTUP_TAG_TYPE {
 	ESP_BOOTUP_EXT_CAPABILITY,
 	/* u64 little-endian nonce used by legacy active-at-boot RCP firmware. */
 	ESP_BOOTUP_RCP_SESSION_NONCE,
+	/* 6-byte configured base MAC followed by one universal MAC count. */
+	ESP_BOOTUP_BASE_MAC_INFO,
 };
 
 enum COMMAND_CODE {

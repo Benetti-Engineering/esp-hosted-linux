@@ -1016,6 +1016,9 @@ static int process_event_esp_bootup(struct esp_adapter *adapter, u8 *evt_buf, u8
 	adapter->capabilities = 0;
 	adapter->ext_capabilities = 0;
 	adapter->rcp_session_nonce = 0;
+	eth_zero_addr(adapter->base_mac);
+	adapter->base_mac_count = 0;
+	adapter->base_mac_present = false;
 	adapter->radio_service_active = ESP_RADIO_SERVICE_NONE;
 	adapter->radio_service_flags = 0;
 	adapter->chipset = ESP_FIRMWARE_CHIP_UNRECOGNIZED;
@@ -1085,6 +1088,19 @@ static int process_event_esp_bootup(struct esp_adapter *adapter, u8 *evt_buf, u8
 				adapter->ext_capabilities = le32_to_cpu(ext_cap_le);
 			}
 			seen_ext_capability = true;
+			break;
+		case ESP_BOOTUP_BASE_MAC_INFO:
+			if (adapter->base_mac_present || tag_len != MAC_ADDR_LEN + 1 ||
+			    !is_valid_ether_addr(pos + 2) ||
+			    (pos[2 + MAC_ADDR_LEN] != 1 &&
+			     pos[2 + MAC_ADDR_LEN] != 2 &&
+			     pos[2 + MAC_ADDR_LEN] != 4)) {
+				ret = -EPROTO;
+				goto fail;
+			}
+			ether_addr_copy(adapter->base_mac, pos + 2);
+			adapter->base_mac_count = pos[2 + MAC_ADDR_LEN];
+			adapter->base_mac_present = true;
 			break;
 		case ESP_BOOTUP_RCP_SESSION_NONCE:
 			if (seen_rcp_nonce || tag_len != sizeof(u64)) {
