@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -e
 
+cd "$(dirname "$0")"
+
 ESP_IDF_DIR="esp-idf"
 FORCE=0
 UPDATE_IDF=0
@@ -58,6 +60,12 @@ for arg in "$@"; do
             ;;
     esac
 done
+
+# Mutual exclusion for -f and -u
+if [ $FORCE -eq 1 ] && [ $UPDATE_IDF -eq 1 ]; then
+    echo "ERROR: -f and -u cannot be used together."
+    exit 1
+fi
 
 # Load .env
 if [ ! -f .env ]; then
@@ -123,20 +131,12 @@ if [ ! -d "$ESP_IDF_DIR" ]; then
     cd ..
     ESP_IDF_PRESENT=1
     ESP_IDF_CORRECT=1
-fi
-
-# Handle -u
-if [ $UPDATE_IDF -eq 1 ]; then
+elif [ $UPDATE_IDF -eq 1 ]; then
     echo "WARNING: This will reset changes inside esp-idf only."
     read -p "Continue? [y/N]: " confirm
     if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
         echo "Aborted."
         exit 1
-    fi
-
-    if [ ! -d "$ESP_IDF_DIR" ]; then
-        echo "esp-idf not found. Cloning it now..."
-        git clone --branch "$IDF_TAG" --depth 100 https://github.com/espressif/esp-idf.git "$ESP_IDF_DIR"
     fi
 
     echo "Updating esp-idf to commit $IDF_COMMIT"
@@ -164,6 +164,6 @@ cd ..
 echo "ESP hosted: replacing wireless libraries"
 mkdir -p "$ESP_IDF_DIR/components/esp_wifi/lib"
 rm -rf "$ESP_IDF_DIR/components/esp_wifi/lib/"*
-cp -r lib/* "$ESP_IDF_DIR/components/esp_wifi/lib/"
+cp -r lib/esp*/ "$ESP_IDF_DIR/components/esp_wifi/lib/"
 
 echo "###### Setup Done ######"
