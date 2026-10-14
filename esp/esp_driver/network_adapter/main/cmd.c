@@ -4309,25 +4309,29 @@ int add_station_node_ap(void *data)
     ESP_LOGI(TAG, "aid=%d\n", aid);
 
 #define STA_FLAG_AUTHORIZED 1
-    if (cmd != ADD_STA) {
-        int err = 0;
+    if (cmd == CHANGE_STA) {
         ESP_LOGD(TAG, "sta_flags_set=%lu, sta_flags_mask=%lu sta_modify_mask=%lu\n",
                  (unsigned long)flags_set, (unsigned long)flags_mask,
                  (unsigned long)le32toh(sta->sta_param.sta_modify_mask));
-        if (flags_set & BIT(STA_FLAG_AUTHORIZED)) {
-            ESP_LOGI(TAG, "%s: authorizing station\n", __func__);
-            err = esp_wifi_wpa_ptk_init_done_internal(sta->sta_param.mac);
-        } else if ((flags_mask & BIT(STA_FLAG_AUTHORIZED)) &&
-                   !(flags_set & BIT(STA_FLAG_AUTHORIZED))) {
-            ESP_LOGE(TAG, "%s: deauthorizing station without deletion is unsupported\n", __func__);
-            return ESP_ERR_NOT_SUPPORTED;
+        if (flags_mask & BIT(STA_FLAG_AUTHORIZED)) {
+            if (flags_set & BIT(STA_FLAG_AUTHORIZED)) {
+                ESP_LOGI(TAG, "%s: authorizing station\n", __func__);
+                /* The internal API returns bool: true is success, not an
+                 * esp_err_t error code. The old test incorrectly rejected
+                 * successfully authorized stations with CMD_RESPONSE_FAIL. */
+                if (!esp_wifi_wpa_ptk_init_done_internal(sta->sta_param.mac)) {
+                    ESP_LOGE(TAG, "%s: PTK initialization not accepted", __func__);
+                    return ESP_FAIL;
+                }
+            } else {
+                /* No atomic deauthorize primitive is available. Never
+                 * falsely acknowledge a blocked data port as closed. */
+                ESP_LOGW(TAG, "%s: AP station deauthorization unsupported", __func__);
+                return ESP_ERR_NOT_SUPPORTED;
+            }
         }
-        if (err) {
-            ESP_LOGE(TAG, "%s: station modify failed err=%d\n", __func__, err);
-            return err;
-        }
-        return 0;
-    } else {
+        return ESP_OK;
+    } else if (cmd == ADD_STA) {
         ESP_LOG_BUFFER_HEXDUMP("supported_rates", sta->sta_param.supported_rates, 12, ESP_LOG_INFO);
         ESP_LOG_BUFFER_HEXDUMP("ht_rates", sta->sta_param.ht_caps, 28, ESP_LOG_INFO);
         ESP_LOG_BUFFER_HEXDUMP("vht_rates", sta->sta_param.vht_caps, 14, ESP_LOG_INFO);
@@ -4338,6 +4342,8 @@ int add_station_node_ap(void *data)
                                   sta->sta_param.vht_caps[0] ? sta->sta_param.vht_caps : NULL,
                                   sta->sta_param.he_caps[0] ? sta->sta_param.he_caps : NULL);
     }
+    ESP_LOGE(TAG, "Invalid AP station operation cmd=%u", cmd);
+    return ESP_ERR_INVALID_ARG;
 }
 
 static int add_node_ap(void *args)
