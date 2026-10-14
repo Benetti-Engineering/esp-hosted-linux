@@ -123,6 +123,9 @@ struct command_node {
 struct esp_adapter {
 	struct device           *dev;
 	struct wiphy            *wiphy;
+	u8                      base_mac[MAC_ADDR_LEN];
+	u8                      base_mac_count;
+	bool                    base_mac_present;
 
 	uint8_t                 if_type;
 	atomic_t                state;
