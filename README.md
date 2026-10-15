@@ -62,7 +62,7 @@ For the complete bring-up flow, follow [Quick start](docs/getting-started/quick-
 - **Getting started** — [Quick start](docs/getting-started/quick-start.md), [hardware setup](docs/getting-started/hardware-setup.md), [build and flash](docs/getting-started/build-and-flash.md)
 - **Wireless guides** — [Station](docs/guides/wifi-station.md), [access point](docs/guides/wifi-access-point.md), [Bluetooth](docs/guides/bluetooth.md), [IEEE 802.15.4 RCP (Thread / Zigbee)](docs/guides/thread-rcp.md), [host sleep](docs/guides/host-sleep.md), [OTA](docs/guides/ota.md)
 - **Architecture** — [Overview](docs/architecture/overview.md), [SDIO](docs/architecture/sdio.md), [SPI](docs/architecture/spi.md), [USB](docs/architecture/usb.md)
-- **Reference** — [Supported hardware](docs/reference/supported-hardware.md), [performance](docs/reference/performance.md), [repository layout](docs/reference/repository-layout.md), [Raspberry Pi reference setup](docs/reference/raspberry-pi.md)
+- **Reference** — [Supported hardware](docs/reference/supported-hardware.md), [performance](docs/reference/performance.md), [repository layout](docs/reference/repository-layout.md), [Raspberry Pi reference setup](docs/reference/raspberry-pi.md), [SPI-HD / QSPI](docs/rpi5-spi-hd-qio.md)
 - **Platform work** — [Porting](docs/porting.md), [troubleshooting](docs/troubleshooting.md)
 - **Migration** — [Move from `esp_hosted`](docs/migration.md), [repository origin](ORIGIN.md)
 

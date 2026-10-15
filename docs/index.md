@@ -33,5 +33,6 @@ New to ESP-Hosted-Linux? Start with [Quick start](getting-started/quick-start.md
 - [Repository layout](reference/repository-layout.md) — where host, firmware, docs, and tools live
 - [Porting](porting.md) — integrate ESP-Hosted-Linux with another Linux platform
 - [Troubleshooting](troubleshooting.md) — debug transport bring-up, Wi-Fi, Bluetooth, and Thread/RCP failures
-- [Raspberry Pi reference setup](reference/raspberry-pi.md) — optional lab/reference pin mappings, boot configuration, and helper script
+- [Raspberry Pi reference setup](reference/raspberry-pi.md) — board pin mappings, boot configuration, and helper script
+- [SPI-HD / QSPI on Raspberry Pi 5](rpi5-spi-hd-qio.md) — quad wiring, firmware configuration, and Linux host setup
 - [Migration](migration.md) — move work from the old `esp_hosted_ng/` tree

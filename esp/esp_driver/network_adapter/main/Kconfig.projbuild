@@ -23,11 +23,8 @@ menu "Example Configuration"
             bool "SPI half-duplex/QIO interface (experimental)"
             depends on SOC_SPI_SUPPORT_SLAVE_HD_VER2
             help
-                Experimental ESP SPI Slave HD transport. Quad mode uses four
-                bidirectional data lines. Initial hardware qualification is
-                limited to Raspberry Pi 5 RP1 SPI0 and ESP32-C5; additional
-                host controllers and ESP targets require validation.
-                A quad-capable Linux SPI controller driver is required.
+                ESP SPI Slave-HD transport. Quad mode uses four bidirectional
+                data lines and requires a quad-capable host SPI controller.
 
         config ESP_USB_HOST_INTERFACE
             bool "USB interface"
@@ -104,12 +101,6 @@ menu "Example Configuration"
         help
             CPOL/CPHA mode. Host and ESP must use the same mode.
 
-    # Defaults below are ESP co-processor GPIOs, not Raspberry Pi header
-    # GPIO numbers. For S2/S3 prefer the native SPI2 IO_MUX pins; for C2,
-    # C3/C6 use the ESP-Hosted SPI-HD co-processor reference. Preserve the
-    # Pi5/C5 physically-qualified GPIO-matrix mapping. C61 uses the SPI2
-    # IO_MUX pins, and S31 retains its project reference GPIO-matrix map.
-    # Actual board pin routing is independently configurable in menuconfig.
     config ESP_SPI_HD_GPIO_CS
         int "CS GPIO"
         default 4 if IDF_TARGET_ESP32C5
@@ -177,16 +168,16 @@ menu "Example Configuration"
 
     config ESP_SPI_HD_DMA_APPEND
         bool "Preload chained SPI-HD DMA descriptors"
-        default n
+        default y
         help
             Use the SPI Slave-HD append APIs. RX credits are published after
             each descriptor is appended, rather than after per-segment rearm.
-            Keep disabled until the target and host pass integrity/recovery tests.
+            Enabled by default when SPI-HD is selected.
 
     config ESP_SPI_HD_TX_BATCH
         bool "Batch queued Hosted frames in one E2H DMA transfer"
         depends on ESP_SPI_HD_DMA_APPEND
-        default n
+        default y
         help
             Aggregate up to two complete frames (at most 3200 bytes) with zero alignment padding.
             Requires a host which parses the advertised larger TX capacity.
@@ -196,7 +187,7 @@ menu "Example Configuration"
     config ESP_SPI_HD_TX_LEN_MIRROR
         bool "Publish mirrored E2H lengths for a single register read"
         depends on ESP_SPI_HD_TX_BATCH
-        default n
+        default y
         help
             Publish tagged counters at shared-buffer offsets 0x18 and 0x1c,
             higher address first. Tags use six spare bits in the existing

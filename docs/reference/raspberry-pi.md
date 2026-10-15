@@ -37,6 +37,18 @@ Recent Raspberry Pi OS images keep this file at `/boot/firmware/config.txt`; old
 
 The project helper builds and loads `spidev_disabler.dts` before inserting the ESP SPI module so `spidev` does not claim the same chip select.
 
+## Optional SPI-HD / QSPI on Raspberry Pi 5
+
+`spi_hd` uses ESP SPI Slave-HD with four bidirectional data lines
+(SIO0–SIO3). Unlike standard `spi`, it needs no Handshake GPIO.
+
+Raspberry Pi 5 RP1 SPI0 requires a Linux driver with quad-transfer
+support. Pi 4 and older onboard SPI controllers lack quad support.
+Other hosts need compatible controller drivers and pin configuration.
+
+See [SPI-HD / QSPI setup](../rpi5-spi-hd-qio.md) for wiring, firmware
+configuration and host bring-up.
+
 ## SDIO reference wiring
 
 Use the ESP-side signal assignments and pull-up guidance from [Hardware setup](../getting-started/hardware-setup.md#sdio). On Raspberry Pi, the reference mapping is:
