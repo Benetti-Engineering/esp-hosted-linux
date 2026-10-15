@@ -253,8 +253,8 @@ static inline void timer_setup(struct timer_list *timer,
 }
 #endif
 
-/* cfg80211 renamed sae_data to auth_data in 4.12. */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 12, 0)
+/* cfg80211 renamed sae_data to auth_data in 4.10. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 10, 0)
 #define ESP_CFG80211_AUTH_DATA(req)		((req)->auth_data)
 #define ESP_CFG80211_AUTH_DATA_LEN(req)		((req)->auth_data_len)
 #else
