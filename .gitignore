@@ -26,6 +26,13 @@ host/spi/*.o
 host/spi/*.mod
 host/spi/*.mod.c
 host/spi/.*.cmd
+host/spi_hd/*.o
+host/spi_hd/*.mod
+host/spi_hd/*.mod.c
+host/spi_hd/.*.cmd
+host/spi_hd/.*.d
+host/rpi5_spi_hd/__pycache__/
+host/overlays/*.dtbo
 host/sdio/*.o
 host/sdio/*.mod
 host/sdio/*.mod.c
