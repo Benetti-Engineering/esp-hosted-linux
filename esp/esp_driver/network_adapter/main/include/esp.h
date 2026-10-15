@@ -35,7 +35,7 @@ extern uint32_t sdio_tx_aggr_size;
 #define SDIO_TX_AGGR_SIZE        sdio_tx_aggr_size
 #define SDIO_TX_LATENCY_BYPASS_SIZE 256
 
-#elif defined CONFIG_ESP_SPI_HOST_INTERFACE
+#elif defined CONFIG_ESP_SPI_HOST_INTERFACE || defined CONFIG_ESP_SPI_HD_HOST_INTERFACE
 #define RX_BUF_SIZE              1600
 
 #elif defined CONFIG_ESP_USB_HOST_INTERFACE

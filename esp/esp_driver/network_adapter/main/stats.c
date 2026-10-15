@@ -133,6 +133,7 @@ static void log_runtime_stats_task(void* pvParameters)
 
 static portMUX_TYPE raw_tp_stats_lock = portMUX_INITIALIZER_UNLOCKED;
 static uint32_t raw_tp_interval;
+static int64_t raw_tp_last_stats_us;
 
 uint8_t raw_tp_tx_buf[TEST_RAW_TP__BUF_SIZE] = {0};
 uint64_t test_raw_tp_rx_len;
@@ -146,6 +147,7 @@ static uint64_t raw_tp_rx_lost;
 static uint64_t raw_tp_rx_dup;
 static uint64_t raw_tp_rx_reorder;
 static uint32_t raw_tp_rx_error_logs;
+static uint64_t raw_tp_rx_bad_payload;
 static uint64_t raw_tp_tx_failed_frames;
 enum raw_tp_task_state {
     RAW_TP_TASK_STOPPED = 0,
@@ -165,6 +167,55 @@ static volatile uint32_t raw_tp_active_type;
 static volatile bool s_raw_tp_timer_enabled;
 static volatile bool s_raw_tp_timer_in_callback;
 
+/* Raw benchmark v2: changing bytes expose insertion/repetition in DMA. */
+static uint32_t raw_tp_pattern_next(uint32_t state)
+{
+    state ^= state << 13;
+    state ^= state >> 17;
+    return state ^ (state << 5);
+}
+
+static void raw_tp_pattern_fill(uint8_t *data, size_t len, uint32_t seq, uint32_t run_id)
+{
+    uint32_t state = seq ^ (run_id * 0x9e3779b9U) ^ 0x6d2b79f5U;
+    size_t i;
+
+    for (i = sizeof(struct raw_tp_packet); i + 4 <= len; i += 4) {
+        uint32_t wire_word;
+        state = raw_tp_pattern_next(state);
+        wire_word = htole32(state);
+        memcpy(data + i, &wire_word, sizeof(wire_word));
+    }
+    if (i < len) {
+        state = raw_tp_pattern_next(state);
+        for (; i < len; i++)
+            data[i] = state >> ((i & 3) * 8);
+    }
+}
+
+static bool raw_tp_pattern_valid(const uint8_t *data, size_t len, uint32_t seq, uint32_t run_id)
+{
+    uint32_t state = seq ^ (run_id * 0x9e3779b9U) ^ 0x6d2b79f5U;
+    size_t i;
+
+    if (len < sizeof(struct raw_tp_packet))
+        return false;
+    for (i = sizeof(struct raw_tp_packet); i + 4 <= len; i += 4) {
+        uint32_t wire_word;
+        state = raw_tp_pattern_next(state);
+        memcpy(&wire_word, data + i, sizeof(wire_word));
+        if (le32toh(wire_word) != state)
+            return false;
+    }
+    if (i < len) {
+        state = raw_tp_pattern_next(state);
+        for (; i < len; i++)
+            if (data[i] != (uint8_t)(state >> ((i & 3) * 8)))
+                return false;
+    }
+    return true;
+}
+
 static void raw_tp_reset_stats(void)
 {
     portENTER_CRITICAL(&raw_tp_stats_lock);
@@ -178,6 +229,7 @@ static void raw_tp_reset_stats(void)
     raw_tp_rx_dup = 0;
     raw_tp_rx_reorder = 0;
     raw_tp_rx_error_logs = 0;
+    raw_tp_rx_bad_payload = 0;
     raw_tp_tx_failed_frames = 0;
     raw_tp_interval = 0;
     portEXIT_CRITICAL(&raw_tp_stats_lock);
@@ -240,12 +292,14 @@ uint32_t debug_raw_tp_get_run_id(void)
 
 bool debug_raw_tp_is_e2h_active(void)
 {
-    return raw_tp_active_type == CMD_RAW_TP_ESP_TO_HOST;
+    return raw_tp_active_type == CMD_RAW_TP_ESP_TO_HOST ||
+           raw_tp_active_type == CMD_RAW_TP_BIDIRECTIONAL;
 }
 
 bool debug_raw_tp_is_run_active(uint32_t run_id)
 {
-    return (raw_tp_active_type == CMD_RAW_TP_ESP_TO_HOST) &&
+    return (raw_tp_active_type == CMD_RAW_TP_ESP_TO_HOST ||
+            raw_tp_active_type == CMD_RAW_TP_BIDIRECTIONAL) &&
            (run_id == s_raw_tp_run_id);
 }
 
@@ -258,11 +312,12 @@ void debug_update_raw_tp_rx_count(const struct esp_payload_header *header,
     uint16_t offset;
     const struct raw_tp_packet *tp_pkt;
 
-    if (raw_tp_active_type != CMD_RAW_TP_HOST_TO_ESP || !header)
+    if ((raw_tp_active_type != CMD_RAW_TP_HOST_TO_ESP &&
+         raw_tp_active_type != CMD_RAW_TP_BIDIRECTIONAL) || !header)
         return;
 
     offset = le16toh(header->offset);
-    if (len >= offset + sizeof(struct raw_tp_packet)) {
+    if (len >= sizeof(struct raw_tp_packet)) {
         tp_pkt = (const struct raw_tp_packet *)((const uint8_t *)header + offset);
         seq = le32toh(tp_pkt->seq);
         run_id = le32toh(tp_pkt->run_id);
@@ -274,6 +329,14 @@ void debug_update_raw_tp_rx_count(const struct esp_payload_header *header,
     if (run_id != s_raw_tp_run_id)
         return;
 
+    if (len != TEST_RAW_TP__BUF_SIZE ||
+        !raw_tp_pattern_valid((const uint8_t *)header + offset, len,
+                              seq, run_id)) {
+        portENTER_CRITICAL(&raw_tp_stats_lock);
+        raw_tp_rx_bad_payload++;
+        portEXIT_CRITICAL(&raw_tp_stats_lock);
+        return;
+    }
     portENTER_CRITICAL(&raw_tp_stats_lock);
     diff = (int32_t)(seq - raw_tp_rx_expected_seq);
     raw_tp_rx_total++;
@@ -342,9 +405,11 @@ static void raw_tp_timer_func(void *arg)
     uint64_t lost;
     uint64_t dup;
     uint64_t reorder;
+    uint64_t bad_payload;
     uint32_t tx_seq;
     uint32_t interval;
     double actual_bandwidth;
+    int64_t now_us, elapsed_us;
 
     (void)arg;
     portENTER_CRITICAL(&raw_tp_stats_lock);
@@ -353,6 +418,9 @@ static void raw_tp_timer_func(void *arg)
         return;
     }
     s_raw_tp_timer_in_callback = true;
+    now_us = esp_timer_get_time();
+    elapsed_us = now_us - raw_tp_last_stats_us;
+    raw_tp_last_stats_us = now_us;
     bytes = test_raw_tp_rx_len;
     test_raw_tp_rx_len = 0;
     failed = raw_tp_tx_failed_frames;
@@ -360,18 +428,20 @@ static void raw_tp_timer_func(void *arg)
     lost = raw_tp_rx_lost;
     dup = raw_tp_rx_dup;
     reorder = raw_tp_rx_reorder;
+    bad_payload = raw_tp_rx_bad_payload;
     tx_seq = raw_tp_tx_seq;
     interval = raw_tp_interval++;
     portEXIT_CRITICAL(&raw_tp_stats_lock);
 
-    actual_bandwidth = (double)(bytes * 8ULL) / 1024.0;
+    actual_bandwidth = elapsed_us > 0 ?
+        (double)bytes * 8.0 * 1000.0 / (double)elapsed_us : 0.0;
     ESP_LOGI(TAG, "%"PRIu32"-%"PRIu32" sec       %.2f kbits/sec",
              interval, interval + 1, actual_bandwidth);
-    ESP_LOGD(TAG, "%"PRIu32"-%"PRIu32" sec %.2f kbits/sec tx_completed=%"PRIu32
+    ESP_LOGI(TAG, "RAW_TP %"PRIu32"-%"PRIu32" sec tx_completed=%"PRIu32
              " tx_failed=%"PRIu64" seq_total=%"PRIu64
-             " lost=%"PRIu64" dup=%"PRIu64" reorder=%"PRIu64,
-             interval, interval + 1, actual_bandwidth, tx_seq, failed,
-             total, lost, dup, reorder);
+             " lost=%"PRIu64" dup=%"PRIu64" reorder=%"PRIu64" bad_payload=%"PRIu64,
+             interval, interval + 1, tx_seq, failed,
+             total, lost, dup, reorder, bad_payload);
 
     portENTER_CRITICAL(&raw_tp_stats_lock);
     s_raw_tp_timer_in_callback = false;
@@ -397,7 +467,8 @@ static void raw_tp_tx_task(void *pvParameters)
     portEXIT_CRITICAL(&raw_tp_stats_lock);
 
     while (!s_raw_tp_task_should_stop) {
-        if (!datapath || raw_tp_active_type != CMD_RAW_TP_ESP_TO_HOST) {
+        if (!datapath || (raw_tp_active_type != CMD_RAW_TP_ESP_TO_HOST &&
+                          raw_tp_active_type != CMD_RAW_TP_BIDIRECTIONAL)) {
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
@@ -413,6 +484,7 @@ static void raw_tp_tx_task(void *pvParameters)
         uint32_t cur_seq = raw_tp_tx_seq_local++;
         tp_pkt->seq = htole32(cur_seq);
         tp_pkt->run_id = htole32(s_raw_tp_run_id);
+        raw_tp_pattern_fill(tx_buf, TEST_RAW_TP__BUF_SIZE, cur_seq, s_raw_tp_run_id);
 
         interface_buffer_handle_t buf_handle = {0};
         buf_handle.if_type = ESP_TEST_IF;
@@ -552,6 +624,7 @@ static esp_err_t start_timer_to_display_raw_tp(void)
     }
 
     portENTER_CRITICAL(&raw_tp_stats_lock);
+    raw_tp_last_stats_us = esp_timer_get_time();
     s_raw_tp_timer_enabled = true;
     portEXIT_CRITICAL(&raw_tp_stats_lock);
 
@@ -630,6 +703,8 @@ void debug_get_raw_tp_conf(uint32_t raw_tp_type)
         ESP_LOGI(TAG, "\n\n*** Raw Throughput testing: ESP --> Host started ***\n");
     } else if (raw_tp_type == CMD_RAW_TP_HOST_TO_ESP) {
         ESP_LOGI(TAG, "\n\n*** Raw Throughput testing: Host --> ESP started ***\n");
+    } else if (raw_tp_type == CMD_RAW_TP_BIDIRECTIONAL) {
+        ESP_LOGI(TAG, "RAW_TP simultaneous bidirectional traffic enabled");
     }
 }
 
@@ -697,11 +772,13 @@ int process_raw_tp(uint8_t if_type, uint8_t *payload, uint16_t payload_len)
 
     header = (struct command_header *)payload;
     if (header->cmd_code != CMD_RAW_TP_ESP_TO_HOST &&
-        header->cmd_code != CMD_RAW_TP_HOST_TO_ESP) {
+        header->cmd_code != CMD_RAW_TP_HOST_TO_ESP &&
+        header->cmd_code != CMD_RAW_TP_BIDIRECTIONAL) {
         ESP_LOGE(TAG, "Invalid raw throughput command code=%u", header->cmd_code);
         return ESP_ERR_INVALID_ARG;
     }
-    need_tx_task = header->cmd_code == CMD_RAW_TP_ESP_TO_HOST;
+    need_tx_task = header->cmd_code == CMD_RAW_TP_ESP_TO_HOST ||
+                   header->cmd_code == CMD_RAW_TP_BIDIRECTIONAL;
 
     buf_handle.if_type = if_type;
     buf_handle.if_num = 0;
