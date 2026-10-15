@@ -213,6 +213,7 @@ void esp_schedule_recovery(struct esp_adapter *adapter,
 		esp_recovery_drop_tx_unlocked(adapter);
 	spin_unlock_irqrestore(&adapter->fw_recovery_lock, flags);
 
+
 	if (!delay_ms)
 		delay_ms = ESP_FW_RECOVERY_QUIET_MS;
 
@@ -460,6 +461,12 @@ static void esp_fw_recovery_work(struct work_struct *work)
 		}
 		clear_bit(ESP_FW_RECOVERY_PENDING, &adapter->state_flags);
 		spin_unlock_irqrestore(&adapter->fw_recovery_lock, flags);
+		/* The transport worker must be rearmed AFTER PENDING is cleared.
+		 * Otherwise a fast worker can observe recovery still pending, exit,
+		 * and miss a level-high data-ready pin or an already-queued TX skb.
+		 */
+		if (adapter->if_ops && adapter->if_ops->resume_after_live_recovery)
+			adapter->if_ops->resume_after_live_recovery(adapter);
 		esp_info("Transport recovery: existing session restored\n");
 		return;
 	}
@@ -1361,8 +1368,21 @@ static int process_event_esp_bootup(struct esp_adapter *adapter, u8 *evt_buf, u8
 	}
 
 #if TEST_RAW_TP
-	if (raw_tp_mode != 0)
+	/* E2H receiver was armed before the firmware start command. Preserve
+	 * its seq0 accounting; publish H2E producer only after commit.
+	 */
+	if (raw_tp_mode == ESP_TEST_RAW_TP_HOST_TO_ESP) {
 		process_test_capabilities(raw_tp_mode);
+	} else if (raw_tp_mode == (ESP_TEST_RAW_TP_HOST_TO_ESP |
+				   ESP_TEST_RAW_TP_ESP_TO_HOST)) {
+		/* E2H was already armed before firmware start; do not reset its
+		 * sequence counters when starting the host TX producer. */
+		ret = esp_raw_tp_enable_h2e_tx();
+		if (ret) {
+			esp_err("Failed to start bidirectional H2E producer: %d\n", ret);
+			goto fail_after_commit;
+		}
+	}
 #endif
 	print_capabilities(adapter->capabilities);
 	print_ext_capabilities(adapter->ext_capabilities);
@@ -2000,6 +2020,24 @@ static bool esp_internal_checksum_required(const u8 *frame, u16 len,
 	return wire_checksum != 0;
 }
 
+/* A live resync keeps the firmware incarnation and validated queued RX.
+ * SPI-HD opts in; reset, teardown and all other transports retain quarantine.
+ */
+static bool esp_rx_session_ready(struct esp_adapter *adapter)
+{
+	if (atomic_read(&adapter->state) >= ESP_CONTEXT_READY)
+		return true;
+	if (atomic_read(&adapter->state) != ESP_CONTEXT_RX_READY)
+		return false;
+	return adapter->if_ops && adapter->if_ops->rx_during_live_recovery &&
+		test_bit(ESP_INIT_DONE, &adapter->state_flags) &&
+		test_bit(ESP_FW_RECOVERY_PENDING, &adapter->state_flags) &&
+		!test_bit(ESP_FW_RESET_EXPECTED, &adapter->state_flags) &&
+		!test_bit(ESP_CLEANUP_IN_PROGRESS, &adapter->state_flags) &&
+		!test_bit(ESP_DRIVER_UNLOADING, &adapter->state_flags) &&
+		!test_bit(ESP_TRANSPORT_REMOVING, &adapter->state_flags);
+}
+
 static void process_rx_packet(struct esp_adapter *adapter, struct sk_buff *skb)
 {
 	struct esp_wifi_device *priv = NULL;
@@ -2066,7 +2104,7 @@ static void process_rx_packet(struct esp_adapter *adapter, struct sk_buff *skb)
 
 	if (payload_header->if_type != ESP_INTERNAL_IF &&
 	    payload_header->if_type != ESP_RCP_IF &&
-	    atomic_read(&adapter->state) < ESP_CONTEXT_READY) {
+	    !esp_rx_session_ready(adapter)) {
 		dev_kfree_skb_any(skb);
 		return;
 	}
