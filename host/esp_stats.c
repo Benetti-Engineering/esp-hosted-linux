@@ -120,7 +120,11 @@ void esp_raw_tp_tx_complete(u32 run_id, u32 frame_count)
 	atomic_long_add((long)frame_count * TEST_RAW_TP__BUF_SIZE, &test_raw_tp_len);
 }
 
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 15, 0))
 static void log_raw_tp_stats_timer_cb(struct timer_list *timer)
+#else
+static void log_raw_tp_stats_timer_cb(unsigned long data)
+#endif
 {
 	unsigned long actual_bandwidth = 0;
 	long bytes_completed = 0;
@@ -248,7 +252,11 @@ static void process_raw_tp_flags(void)
 		}
 		atomic_set(&raw_tp_queue_paused, 0);
 
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 15, 0))
 		timer_setup(&log_raw_tp_stats_timer, log_raw_tp_stats_timer_cb, 0);
+#else
+		setup_timer(&log_raw_tp_stats_timer, log_raw_tp_stats_timer_cb, 0);
+#endif
 		WRITE_ONCE(log_raw_tp_stats_timer_running, 1);
 		mod_timer(&log_raw_tp_stats_timer, jiffies + msecs_to_jiffies(1000));
 
