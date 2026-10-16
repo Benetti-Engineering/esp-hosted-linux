@@ -479,7 +479,7 @@ uint32_t get_bluetooth_capabilities(void)
     uint32_t cap = 0;
     ESP_LOGI(BT_TAG, "- BT/BLE");
 #if BLUETOOTH_HCI
-#if CONFIG_ESP_SPI_HOST_INTERFACE
+#if CONFIG_ESP_SPI_HOST_INTERFACE || CONFIG_ESP_SPI_HD_HOST_INTERFACE
     ESP_LOGI(BT_TAG, "   - HCI Over SPI");
     cap |= ESP_BT_SPI_SUPPORT;
 #elif CONFIG_ESP_USB_HOST_INTERFACE

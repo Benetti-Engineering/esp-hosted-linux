@@ -33,3 +33,4 @@ include:
   - local: '.gitlab/ci/governance.yml'
   - local: '.gitlab/ci/linux.yml'
   - local: '.gitlab/ci/firmware-build.yml'
+  - local: '.gitlab/ci/qspi-build.yml'

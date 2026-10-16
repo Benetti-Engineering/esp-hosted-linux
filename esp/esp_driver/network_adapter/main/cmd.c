@@ -4477,6 +4477,7 @@ static const struct esp_cmd_entry s_cmd_table[] = {
     { CMD_SET_REG_DOMAIN,      sizeof(struct cmd_reg_domain),          process_reg_set,            "SET_REG" },
     { CMD_RAW_TP_ESP_TO_HOST,  0,                                      process_raw_tp,             "RAW_TP_E2H" },
     { CMD_RAW_TP_HOST_TO_ESP,  0,                                      process_raw_tp,             "RAW_TP_H2E" },
+    { CMD_RAW_TP_BIDIRECTIONAL, 0,                                     process_raw_tp,             "RAW_TP_BIDIR" },
     { CMD_SET_WOW_CONFIG,      sizeof(struct cmd_wow_config),          process_wow_set,            "SET_WOW" },
     { CMD_SET_MODE,            0,                                      process_set_mode,           "SET_MODE" },
     { CMD_SET_IE,              0,                                      process_set_ie,             "SET_IE" },

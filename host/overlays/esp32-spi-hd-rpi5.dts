@@ -1,0 +1,88 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Raspberry Pi 5 SPI0 Quad/QIO overlay for ESP-Hosted SPI-HD.
+ *
+ * RP1 SPI0 maps:
+ *   SIO0 = GPIO10 (header pin 19)
+ *   SIO1 = GPIO9  (header pin 21)
+ *   SIO2 = GPIO1  (header pin 28)
+ *   SIO3 = GPIO0  (header pin 27)
+ *   SCLK = GPIO11 (header pin 23)
+ *   CE0  = GPIO8  (header pin 24)
+ *
+ * Load spidev_disabler.dtbo before this overlay when spi0.0 is owned by
+ * spidev. The extra Data_Ready and Reset GPIOs are parameterised.
+ */
+
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "brcm,bcm2712";
+
+	fragment@0 {
+		target = <&spi0_pins>;
+		__overlay__ {
+			/* RP1 quad mode adds SIO2/SIO3 on GPIO1/GPIO0. */
+			pins = "gpio9", "gpio10", "gpio11", "gpio0", "gpio1";
+		};
+	};
+
+	fragment@1 {
+		target = <&spi0>;
+		__overlay__ {
+			status = "okay";
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			esp_spi_hd: esp_spi_hd@0 {
+				compatible = "espressif,esp32-spi-hd";
+				reg = <0>;
+				spi-max-frequency = <40000000>;
+				spi-rx-bus-width = <4>;
+				rx-sample-delay-ns = <0>;
+				spi-tx-bus-width = <4>;
+
+				/* ESP SPI-HD reference default: mode 3 (CPOL=1, CPHA=1). */
+				spi-cpol;
+				spi-cpha;
+
+				/* Host -> ESP EN/reset, logical active means physical low. */
+				reset-gpios = <&gpio 6 1>;
+
+				/* ESP -> host, active high by default. */
+				data-ready-gpios = <&gpio 12 0>;
+
+				pinctrl-names = "default";
+				pinctrl-0 = <&esp_spi_hd_reset_pin
+					     &esp_spi_hd_data_ready_pin>;
+				status = "okay";
+			};
+		};
+	};
+
+	fragment@2 {
+		target = <&gpio>;
+		__overlay__ {
+			esp_spi_hd_reset_pin: esp_spi_hd_reset_pin {
+				brcm,pins = <6>;
+				bias-pull-up;
+			};
+
+			esp_spi_hd_data_ready_pin: esp_spi_hd_data_ready_pin {
+				brcm,pins = <12>;
+				bias-pull-down;
+			};
+
+		};
+	};
+
+	__overrides__ {
+		resetgpio = <&esp_spi_hd>,"reset-gpios:4",
+			    <&esp_spi_hd_reset_pin>,"brcm,pins:0";
+		datareadygpio = <&esp_spi_hd>,"data-ready-gpios:4",
+				<&esp_spi_hd_data_ready_pin>,"brcm,pins:0";
+		max_frequency = <&esp_spi_hd>,"spi-max-frequency:0";
+		rx_sample_delay_ns = <&esp_spi_hd>,"rx-sample-delay-ns:0";
+	};
+};

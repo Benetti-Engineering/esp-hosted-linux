@@ -23,3 +23,10 @@ CONFIG_ESP_WIFI_ENABLE_WPA3_OWE_STA=n
 CONFIG_ESP_WIFI_ENABLE_WPA3_OWE_SOFTAP=n
 CONFIG_ESP_WIFI_ENTERPRISE_SUPPORT=n
 CONFIG_ESP_WIFI_GCMP_SUPPORT=y
+
+# Interim SPI-HD defaults on all Slave-HD-v2 capable ESP targets.
+# These are effective only when the SPI-HD interface is selected.
+# Match Kconfig optimization defaults; per-chip hardware qualification is pending.
+CONFIG_ESP_SPI_HD_DMA_APPEND=y
+CONFIG_ESP_SPI_HD_TX_BATCH=y
+CONFIG_ESP_SPI_HD_TX_LEN_MIRROR=y

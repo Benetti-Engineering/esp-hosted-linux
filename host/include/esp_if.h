@@ -34,6 +34,10 @@ struct esp_if_ops {
 	void (*flush_bt_traffic)(struct esp_adapter *adapter);
 	void (*flush_rcp_traffic)(struct esp_adapter *adapter);
 	int (*deinit)(struct esp_adapter *adapter);
+	/* Keep validated RX queued during a live transport resync. */
+	bool rx_during_live_recovery;
+	/* Called only after generic recovery clears PENDING, to rearm missed work. */
+	void (*resume_after_live_recovery)(struct esp_adapter *adapter);
 };
 
 static inline struct sk_buff *esp_if_alloc_skb(struct esp_adapter *adapter, u32 len)

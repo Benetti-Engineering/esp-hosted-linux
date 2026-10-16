@@ -20,7 +20,7 @@ MODULE_NAME := esp32_$(target)
 
 # Device Tree overlay compiler and generated Raspberry Pi SPI overlays.
 DTC ?= dtc
-SPI_DTBOS := spidev_disabler.dtbo overlays/esp32-spi.dtbo
+SPI_DTBOS := spidev_disabler.dtbo overlays/esp32-spi.dtbo overlays/esp32-spi-hd-rpi5.dtbo
 SDIO_DTBOS := overlays/esp32-sdio-pwrseq.dtbo
 
 # Debug and AP support
@@ -53,6 +53,12 @@ ifeq ($(target), spi)
     module_objects += spi/esp_spi.o
 endif
 
+ifeq ($(target), spi_hd)
+    ccflags-y += -I$(src)/spi_hd -DESP_SPI_HD_DEBUGFS
+    EXTRA_CFLAGS += -I$(M)/spi_hd
+    module_objects += spi_hd/esp_spi_hd.o
+endif
+
 ifeq ($(target), usb)
     ccflags-y += -I$(src)/usb
     EXTRA_CFLAGS += -I$(M)/usb
@@ -69,9 +75,12 @@ $(MODULE_NAME)-y := $(module_objects)
 
 # Build targets
 .DELETE_ON_ERROR:
-.PHONY: all clean check spi-dtbo sdio-dtbo
+.PHONY: all incremental clean check spi-dtbo sdio-dtbo
 
 all: clean
+	$(MAKE) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) -C $(KERNEL) M=$(PWD) modules
+
+incremental:
 	$(MAKE) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) -C $(KERNEL) M=$(PWD) modules
 
 spi-dtbo: $(SPI_DTBOS)
@@ -85,6 +94,9 @@ overlays/esp32-spi.dtbo: overlays/esp32-spi.dts
 	$(DTC) -@ -I dts -O dtb -o $@ $<
 
 overlays/esp32-sdio-pwrseq.dtbo: overlays/esp32-sdio-pwrseq.dts
+	$(DTC) -@ -I dts -O dtb -o $@ $<
+
+overlays/esp32-spi-hd-rpi5.dtbo: overlays/esp32-spi-hd-rpi5.dts
 	$(DTC) -@ -I dts -O dtb -o $@ $<
 
 clean:

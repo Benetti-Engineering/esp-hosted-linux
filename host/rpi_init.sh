@@ -18,8 +18,15 @@ OTA_FILE=""
 SPI_RESETGPIO="6"
 SPI_HANDSHAKEGPIO="22"
 SPI_DATAREADYGPIO="27"
+SPI_DATAREADYGPIO_SET="0"
 SPI_MAX_FREQUENCY="30000000"
 SPI_CS_CHANGE="0"
+SPI_HD_TX_SEGMENT="32"
+SPI_HD_FORCE_SIO="0"
+SPI_HD_FORCE_SIO_H2E="0"
+SPI_HD_FORCE_SIO_E2H="0"
+SPI_HD_FORCE_SIO_WREND="0"
+SPI_HD_QIO_ADDR_SINGLE="1"
 
 if [ "$(id -u)" -eq 0 ]; then
     SUDO=()
@@ -48,7 +55,11 @@ overlay_id()
     local name="$1"
 
     command -v dtoverlay >/dev/null 2>&1 || return 1
-    dtoverlay -l 2>/dev/null |
+    # dtoverlay -l can crash without root permissions for root-owned DTBOs.
+    # Never mistake a failed enumeration for an empty overlay registry.
+    local registry=""
+    registry="$(run_root dtoverlay -l)" || return 1
+    printf '%s\n' "$registry" |
         awk -F: -v name="$name" '
             {
                 id=$1
@@ -68,10 +79,15 @@ remove_runtime_overlay()
     local name="$1"
     local id=""
 
-    id="$(overlay_id "$name" || true)"
+    id="$(overlay_id "$name")" ||
+        die "Cannot enumerate privileged overlay registry for $name"
     if [ -n "$id" ]; then
         echo "Removing runtime overlay $name (id $id)"
         run_root dtoverlay -r "$id"
+        id="$(overlay_id "$name")" ||
+            die "Cannot verify runtime overlay cleanup for $name"
+        [ -z "$id" ] ||
+            die "Runtime overlay $name remains registered after removal"
     fi
 }
 
@@ -273,13 +289,14 @@ require_gpio()
 
 wait_for_spi_bind()
 {
+    local expected_driver="$1"
     local retries=20
     local driver=""
 
     while [ "$retries" -gt 0 ]; do
         if [ -L /sys/bus/spi/devices/spi0.0/driver ]; then
             driver="$(basename "$(readlink -f /sys/bus/spi/devices/spi0.0/driver)")"
-            [ "$driver" = "esp_spi" ] && return 0
+            [ "$driver" = "$expected_driver" ] && return 0
         fi
         sleep 0.25
         retries=$((retries - 1))
@@ -329,9 +346,14 @@ build_driver()
     fi
 
     echo "Building for $IF_TYPE protocol"
-    make -j8 "${make_args[@]}"
+    if [ "${ESP_HOSTED_INCREMENTAL:-0}" = "1" ]; then
+        echo "Reusing existing Kbuild objects (ESP_HOSTED_INCREMENTAL=1)"
+        make -j8 "${make_args[@]}" incremental
+    else
+        make -j8 "${make_args[@]}"
+    fi
 
-    if [ "$IF_TYPE" = "spi" ]; then
+    if [ "$IF_TYPE" = "spi" ] || [ "$IF_TYPE" = "spi_hd" ]; then
         command -v dtc >/dev/null 2>&1 || die "dtc is required for SPI Device Tree setup"
         command -v dtoverlay >/dev/null 2>&1 || die "dtoverlay is required for SPI Device Tree setup"
         make spi-dtbo
@@ -358,6 +380,10 @@ unload_esp_modules()
     if module_loaded esp32_spi; then
         echo "Unloading esp32_spi"
         run_root rmmod esp32_spi
+    fi
+    if module_loaded esp32_spi_hd; then
+        echo "Unloading esp32_spi_hd"
+        run_root rmmod esp32_spi_hd
     fi
     if module_loaded esp32_usb; then
         echo "Unloading esp32_usb"
@@ -416,15 +442,102 @@ setup_spi()
     # Normally the driver core binds immediately when the DT child appears.
     # Give it a short chance, then issue one explicit probe for bring-up kernels
     # where auto-probe was disabled externally.
-    if ! wait_for_spi_bind; then
+    if ! wait_for_spi_bind esp_spi; then
         if [ -e /sys/bus/spi/devices/spi0.0 ] &&
            [ -e /sys/bus/spi/drivers_probe ]; then
             printf 'spi0.0\n' | run_root tee /sys/bus/spi/drivers_probe >/dev/null || true
         fi
     fi
 
-    wait_for_spi_bind ||
+    wait_for_spi_bind esp_spi ||
         die "esp32_spi loaded but spi0.0 did not bind; check dmesg for the probe error"
+}
+
+setup_spi_hd()
+{
+    local -a module_args
+
+    if [ ! -r /proc/device-tree/compatible ] ||
+       ! tr '\0' '\n' </proc/device-tree/compatible | grep -qx 'brcm,bcm2712'; then
+        die "SPI-HD/QIO requires an RP1/BCM2712 Raspberry Pi (Pi 5-class). Pi 4 and earlier onboard SPI controllers do not support quad SPI."
+    fi
+
+    require_gpio resetgpio "$SPI_RESETGPIO"
+    require_gpio datareadygpio "$SPI_DATAREADYGPIO"
+
+    [ "$SPI_RESETGPIO" != "$SPI_DATAREADYGPIO" ] ||
+        die "resetgpio and datareadygpio must be distinct"
+
+    # RP1 SPI0 QIO consumes GPIO0/1 and GPIO8..11.
+    case "$SPI_RESETGPIO:$SPI_DATAREADYGPIO" in
+        0:*|1:*|8:*|9:*|10:*|11:*|*:0|*:1|*:8|*:9|*:10|*:11)
+            die "SPI-HD control GPIOs must not overlap RP1 SPI0 QIO GPIO0/1/8/9/10/11"
+            ;;
+    esac
+
+    case "$SPI_MAX_FREQUENCY" in
+        ''|*[!0-9]*) die "max_frequency must be an integer in Hz" ;;
+    esac
+    [ "$SPI_MAX_FREQUENCY" -gt 0 ] || die "max_frequency must be greater than zero"
+    [ "$SPI_MAX_FREQUENCY" -le 40000000 ] ||
+        die "max_frequency exceeds the initial SPI-HD 40 MHz qualification limit"
+
+    case "$SPI_HD_TX_SEGMENT" in
+        ''|*[!0-9]*) die "spi_hd_tx_segment must be an integer in bytes" ;;
+    esac
+    [ "$SPI_HD_TX_SEGMENT" -ge 4 ] ||
+        die "spi_hd_tx_segment must be at least 4 bytes"
+
+    remove_runtime_overlay esp32-spi-hd-rpi5
+    remove_runtime_overlay esp32-spi
+    remove_runtime_overlay spidev_disabler
+
+    module_args=("raw_tp_mode=$RAW_TP_MODE" "spi_hd_tx_segment=$SPI_HD_TX_SEGMENT" "spi_hd_force_sio=$SPI_HD_FORCE_SIO" "spi_hd_force_sio_h2e=$SPI_HD_FORCE_SIO_H2E" "spi_hd_force_sio_e2h=$SPI_HD_FORCE_SIO_E2H" "spi_hd_force_sio_wrend=$SPI_HD_FORCE_SIO_WREND" "spi_hd_qio_addr_single=$SPI_HD_QIO_ADDR_SINGLE")
+    if [ -n "$OTA_FILE" ]; then
+        module_args+=("ota_file=$OTA_FILE")
+    fi
+
+    if ! grep -qw spi_dw /proc/modules || ! grep -qw spi_dw_mmio /proc/modules; then
+        echo "WARNING: DesignWare SPI modules are not loaded." >&2
+    fi
+    echo "NOTE: Raspberry Pi kernel support equivalent to linux#7587 is required."
+    echo "      Use: bash rpi5_spi_hd/build-rp1-quad-modules.sh --load"
+
+    run_root insmod ./esp32_spi_hd.ko "${module_args[@]}"
+
+    echo "Disabling stock spidev0 Device Tree node"
+    run_root dtoverlay -d "$SCRIPT_DIR" spidev_disabler
+
+    # The runtime overlay extends the existing RP1 SPI0 pin group with
+    # GPIO0/GPIO1 (SIO3/SIO2).  On an already-bound SPI0 controller, changing
+    # the pin group's 'pins' property does not necessarily cause pinctrl to
+    # re-select the state.  Force the two additional QIO lanes to SPI0 before
+    # the ESP child is created.  GPIO0=a0 is SPI0_SIO3 and GPIO1=a0 is
+    # SPI0_SIO2 on RP1.
+    command -v pinctrl >/dev/null 2>&1 ||
+        die "pinctrl is required to select RP1 SPI0 SIO2/SIO3 for runtime QIO bring-up"
+    echo "Selecting RP1 SPI0 QIO extra lanes: GPIO0=SIO3 GPIO1=SIO2"
+    run_root pinctrl set 0 a0 pn
+    run_root pinctrl set 1 a0 pn
+    run_root pinctrl get 0
+    run_root pinctrl get 1
+
+    echo "Applying Raspberry Pi 5 ESP SPI-HD/QIO overlay:"
+    echo "  reset=$SPI_RESETGPIO data-ready=$SPI_DATAREADYGPIO max-frequency=$SPI_MAX_FREQUENCY"
+    run_root dtoverlay -d "$SCRIPT_DIR/overlays" esp32-spi-hd-rpi5 \
+        "resetgpio=$SPI_RESETGPIO" \
+        "datareadygpio=$SPI_DATAREADYGPIO" \
+        "max_frequency=$SPI_MAX_FREQUENCY"
+
+    if ! wait_for_spi_bind esp_spi_hd; then
+        if [ -e /sys/bus/spi/devices/spi0.0 ] &&
+           [ -e /sys/bus/spi/drivers_probe ]; then
+            printf 'spi0.0\n' | run_root tee /sys/bus/spi/drivers_probe >/dev/null || true
+        fi
+    fi
+
+    wait_for_spi_bind esp_spi_hd ||
+        die "esp32_spi_hd loaded but spi0.0 did not bind; check dmesg and verify the #7587-compatible RP1 modules are loaded"
 }
 
 setup_sdio()
@@ -501,6 +614,9 @@ wlan_init()
         spi)
             setup_spi
             ;;
+        spi_hd)
+            setup_spi_hd
+            ;;
         sdio)
             setup_sdio
             ;;
@@ -536,7 +652,7 @@ usage()
 This script prepares a Raspberry Pi for ESP-Hosted bring-up.
 
 Usage:
-  ./rpi_init.sh [spi|sdio|usb] [options]
+  ./rpi_init.sh [spi|spi_hd|sdio|usb] [options]
 
 Common options:
   btuart | btuart_4pins
@@ -549,9 +665,15 @@ Common options:
 SPI Device Tree options:
   resetgpio=N           ESP EN/reset BCM GPIO (default: 6)
   handshakegpio=N       ESP handshake BCM GPIO (default: 22)
-  datareadygpio=N       ESP data-ready BCM GPIO (default: 27)
+  datareadygpio=N       ESP data-ready BCM GPIO (SPI: 27; SPI-HD: 12)
   max_frequency=N       spi-max-frequency in Hz (default: 30000000)
-  spi_cs_change=0|1     Optional controller workaround (default: 0)
+  spi_cs_change=0|1     Optional full-duplex controller workaround (default: 0)
+  spi_hd_tx_segment=N    QIO WRDMA segment bytes (default: 32; Pi 5 SPI-HD only)
+  spi_hd_force_sio=0|1    Keep all SPI-HD traffic in SIO after boot (default: 0)
+  spi_hd_force_sio_h2e=0|1 Keep host->ESP WRDMA/register writes in SIO (default: 0)
+  spi_hd_force_sio_e2h=0|1 Keep ESP->host RDDMA/register reads in SIO (default: 0)
+  spi_hd_force_sio_wrend=0|1 Send WR_END in SIO while WRDMA stays QIO (default: 0)
+  spi_hd_qio_addr_single=0|1 Use x1 address with x4 QIO H2E data (default: 1)
 
 Legacy:
   resetpin=N            Alias for resetgpio=N when using SPI
@@ -559,6 +681,7 @@ Legacy:
 Examples:
   ./rpi_init.sh sdio
   ./rpi_init.sh spi
+  ./rpi_init.sh spi_hd resetgpio=6 datareadygpio=12
   ./rpi_init.sh usb
   ./rpi_init.sh spi handshakegpio=5 datareadygpio=12
   ./rpi_init.sh spi resetgpio=6 handshakegpio=5 datareadygpio=12
@@ -573,7 +696,7 @@ parse_arguments()
                 usage
                 exit 0
                 ;;
-            spi|sdio|usb)
+            spi|spi_hd|sdio|usb)
                 IF_TYPE="$1"
                 ;;
             resetgpio=*)
@@ -587,12 +710,51 @@ parse_arguments()
                 ;;
             datareadygpio=*)
                 SPI_DATAREADYGPIO="${1#*=}"
+                SPI_DATAREADYGPIO_SET="1"
                 ;;
             max_frequency=*)
                 SPI_MAX_FREQUENCY="${1#*=}"
                 ;;
             spi_cs_change=*)
                 SPI_CS_CHANGE="${1#*=}"
+                ;;
+            spi_hd_tx_segment=*)
+                SPI_HD_TX_SEGMENT="${1#*=}"
+                ;;
+            spi_hd_force_sio=*)
+                SPI_HD_FORCE_SIO="${1#*=}"
+                case "$SPI_HD_FORCE_SIO" in
+                    0|1) ;;
+                    *) die "spi_hd_force_sio must be 0 or 1" ;;
+                esac
+                ;;
+            spi_hd_force_sio_h2e=*)
+                SPI_HD_FORCE_SIO_H2E="${1#*=}"
+                case "$SPI_HD_FORCE_SIO_H2E" in
+                    0|1) ;;
+                    *) die "spi_hd_force_sio_h2e must be 0 or 1" ;;
+                esac
+                ;;
+            spi_hd_force_sio_e2h=*)
+                SPI_HD_FORCE_SIO_E2H="${1#*=}"
+                case "$SPI_HD_FORCE_SIO_E2H" in
+                    0|1) ;;
+                    *) die "spi_hd_force_sio_e2h must be 0 or 1" ;;
+                esac
+                ;;
+            spi_hd_force_sio_wrend=*)
+                SPI_HD_FORCE_SIO_WREND="${1#*=}"
+                case "$SPI_HD_FORCE_SIO_WREND" in
+                    0|1) ;;
+                    *) die "spi_hd_force_sio_wrend must be 0 or 1" ;;
+                esac
+                ;;
+            spi_hd_qio_addr_single=*)
+                SPI_HD_QIO_ADDR_SINGLE="${1#*=}"
+                case "$SPI_HD_QIO_ADDR_SINGLE" in
+                    0|1) ;;
+                    *) die "spi_hd_qio_addr_single must be 0 or 1" ;;
+                esac
                 ;;
             btuart|btuart_4pins|btuart_4pin)
                 BT_INIT_SET="4"
@@ -623,6 +785,13 @@ parse_arguments()
 }
 
 parse_arguments "$@"
+
+# The existing full-duplex mating-board default is BCM27. QIO needs a
+# separate Data Ready line because SPI0 consumes the extra quad pins; use
+# BCM12 by default for SPI-HD unless the caller explicitly overrides it.
+if [ "$IF_TYPE" = "spi_hd" ] && [ "$SPI_DATAREADYGPIO_SET" = "0" ]; then
+    SPI_DATAREADYGPIO="12"
+fi
 
 run_root modprobe bluetooth
 run_root modprobe cfg80211

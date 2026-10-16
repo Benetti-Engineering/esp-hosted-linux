@@ -17,6 +17,9 @@
 #include <linux/timer.h>
 #include <linux/kthread.h>
 #include <linux/version.h>
+#include <linux/ktime.h>
+#include <linux/math64.h>
+#include <linux/spinlock.h>
 
 /* Linux 6.15 removed the legacy del_timer_sync() spelling. */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 15, 0)
@@ -32,8 +35,10 @@ static struct timer_list log_raw_tp_stats_timer;
 static u8 log_raw_tp_stats_timer_running;
 static atomic_long_t test_raw_tp_len = ATOMIC_LONG_INIT(0);
 static u32 raw_tp_timer_count;
+static u64 raw_tp_last_stats_ns;
 static u32 raw_tp_tx_seq;
 static u32 raw_tp_tx_seq_local;
+static DEFINE_SPINLOCK(raw_tp_rx_stats_lock);
 static u32 raw_tp_rx_expected_seq;
 static u64 raw_tp_rx_window;
 static u32 host_raw_tp_run_id;
@@ -42,14 +47,52 @@ static unsigned long raw_tp_rx_lost;
 static unsigned long raw_tp_rx_dup;
 static unsigned long raw_tp_rx_reorder;
 static u32 raw_tp_rx_error_logs;
+static unsigned long raw_tp_rx_bad_payload;
 static unsigned long raw_tp_tx_failed_frames;
 static unsigned long raw_tp_tx_enqueue_failed;
 static u8 traffic_open_init_done;
 static struct completion traffic_open;
 static atomic_t raw_tp_queue_paused = ATOMIC_INIT(0);
 
+/* Raw benchmark v2: changing bytes expose insertion/repetition in DMA. */
+static u32 raw_tp_pattern_next(u32 state)
+{
+	state ^= state << 13;
+	state ^= state >> 17;
+	return state ^ (state << 5);
+}
+
+static void raw_tp_pattern_fill(u8 *data, size_t len, u32 seq, u32 run_id)
+{
+	u32 state = seq ^ (run_id * 0x9e3779b9U) ^ 0x6d2b79f5U;
+	size_t i;
+
+	for (i = sizeof(struct raw_tp_packet); i < len; i++) {
+		if (!(i & 3))
+			state = raw_tp_pattern_next(state);
+		data[i] = state >> ((i & 3) * 8);
+	}
+}
+
+static bool raw_tp_pattern_valid(const u8 *data, size_t len, u32 seq, u32 run_id)
+{
+	u32 state = seq ^ (run_id * 0x9e3779b9U) ^ 0x6d2b79f5U;
+	size_t i;
+
+	if (len < sizeof(struct raw_tp_packet))
+		return false;
+	for (i = sizeof(struct raw_tp_packet); i < len; i++) {
+		if (!(i & 3))
+			state = raw_tp_pattern_next(state);
+		if (data[i] != (u8)(state >> ((i & 3) * 8)))
+			return false;
+	}
+	return true;
+}
+
 static void raw_tp_reset_stats(void)
 {
+	spin_lock_bh(&raw_tp_rx_stats_lock);
 	atomic_long_set(&test_raw_tp_len, 0);
 	raw_tp_timer_count = 0;
 	raw_tp_tx_seq = 0;
@@ -61,8 +104,10 @@ static void raw_tp_reset_stats(void)
 	raw_tp_rx_dup = 0;
 	raw_tp_rx_reorder = 0;
 	raw_tp_rx_error_logs = 0;
+	raw_tp_rx_bad_payload = 0;
 	raw_tp_tx_failed_frames = 0;
 	raw_tp_tx_enqueue_failed = 0;
+	spin_unlock_bh(&raw_tp_rx_stats_lock);
 }
 
 void esp_raw_tp_set_seq(struct esp_payload_header *header, u32 seq)
@@ -128,22 +173,27 @@ static void log_raw_tp_stats_timer_cb(unsigned long data)
 {
 	unsigned long actual_bandwidth = 0;
 	long bytes_completed = 0;
+	u64 now_ns, elapsed_ns;
 
 	if (!READ_ONCE(log_raw_tp_stats_timer_running))
 		return;
 
 	mod_timer(&log_raw_tp_stats_timer, jiffies + msecs_to_jiffies(1000));
+	now_ns = ktime_get_ns();
+	elapsed_ns = now_ns - raw_tp_last_stats_ns;
+	raw_tp_last_stats_ns = now_ns;
 	bytes_completed = atomic_long_xchg(&test_raw_tp_len, 0);
-	if (bytes_completed > 0)
-		actual_bandwidth = ((unsigned long)bytes_completed * 8) / 1024;
-	esp_dbg("%u-%u sec %lu kbits/sec tx_completed=%u tx_failed=%lu "
-		 "enqueue_failed=%lu seq_total=%lu lost=%lu dup=%lu reorder=%lu\n\r",
+	if (bytes_completed > 0 && elapsed_ns)
+		actual_bandwidth = div64_u64((u64)bytes_completed * 8 * 1000000ULL,
+					    elapsed_ns);
+	esp_info("RAW_TP %u-%u sec %lu kbits/sec tx_completed=%u tx_failed=%lu "
+		 "enqueue_failed=%lu seq_total=%lu lost=%lu dup=%lu reorder=%lu bad_payload=%lu\n\r",
 			raw_tp_timer_count,
 			raw_tp_timer_count + 1, actual_bandwidth,
 			raw_tp_tx_seq, raw_tp_tx_failed_frames,
 			raw_tp_tx_enqueue_failed,
 			raw_tp_rx_total, raw_tp_rx_lost, raw_tp_rx_dup,
-			raw_tp_rx_reorder);
+			raw_tp_rx_reorder, raw_tp_rx_bad_payload);
 
 	raw_tp_timer_count++;
 }
@@ -206,9 +256,11 @@ static int raw_tp_tx_process(void *data)
 			payload_header->packet_type = PACKET_TYPE_DATA;
 			{
 				struct raw_tp_packet *tp_pkt = (struct raw_tp_packet *)(tx_skb->data + pad_len);
-				u32 cur_seq = raw_tp_tx_seq_local++;
+				u32 cur_seq = raw_tp_tx_seq_local;
 				tp_pkt->seq = esp_wire_cpu_to_le32(cur_seq);
 				tp_pkt->run_id = esp_wire_cpu_to_le32(host_raw_tp_run_id);
+				raw_tp_pattern_fill((u8 *)tp_pkt, TEST_RAW_TP__BUF_SIZE,
+						    cur_seq, host_raw_tp_run_id);
 				esp_raw_tp_set_seq(payload_header, cur_seq);
 			}
 			if (adapter->capabilities & ESP_CHECKSUM_ENABLED) {
@@ -222,6 +274,8 @@ static int raw_tp_tx_process(void *data)
 				continue;
 			}
 			ret = esp_send_packet(adapter, tx_skb);
+			if (!ret)
+				raw_tp_tx_seq_local++;
 			if (ret) {
 				raw_tp_tx_enqueue_failed++;
 				/* Do not busy-spin when the transport queue is full or
@@ -257,6 +311,7 @@ static void process_raw_tp_flags(void)
 #else
 		setup_timer(&log_raw_tp_stats_timer, log_raw_tp_stats_timer_cb, 0);
 #endif
+		raw_tp_last_stats_ns = ktime_get_ns();
 		WRITE_ONCE(log_raw_tp_stats_timer_running, 1);
 		mod_timer(&log_raw_tp_stats_timer, jiffies + msecs_to_jiffies(1000));
 
@@ -278,6 +333,31 @@ static void start_test_raw_tp(int raw_tp__host_to_esp)
 {
 	test_raw_tp = 1;
 	test_raw_tp__host_to_esp = raw_tp__host_to_esp;
+}
+
+/*
+ * A combined raw run arms the E2H receiver before the firmware's synchronous
+ * start command. H2E may only begin after reconstruction commits, without
+ * stopping the RX timer or resetting the first packet's sequence counters.
+ */
+int esp_raw_tp_enable_h2e_tx(void)
+{
+	int ret;
+
+	if (!test_raw_tp || !READ_ONCE(log_raw_tp_stats_timer_running))
+		return -EINVAL;
+	if (test_raw_tp__host_to_esp || raw_tp_tx_thread)
+		return -EBUSY;
+
+	test_raw_tp__host_to_esp = 1;
+	raw_tp_tx_thread = kthread_run(raw_tp_tx_process, NULL, "raw tp thrd");
+	if (IS_ERR(raw_tp_tx_thread)) {
+		ret = PTR_ERR(raw_tp_tx_thread);
+		raw_tp_tx_thread = NULL;
+		test_raw_tp__host_to_esp = 0;
+		return ret;
+	}
+	return 0;
 }
 
 static void stop_test_raw_tp(void)
@@ -334,16 +414,17 @@ void update_test_raw_tp_rx_stats(const struct esp_payload_header *header,
 	u32 seq;
 	u32 run_id = 0;
 	s32 diff;
+	bool payload_valid;
 	u16 offset;
 	const struct raw_tp_packet *tp_pkt;
 
 	/* Ignore frames racing with teardown after the stats timer was stopped. */
 	if (!READ_ONCE(log_raw_tp_stats_timer_running) ||
-	    test_raw_tp__host_to_esp || !header)
+	    !(raw_tp_mode & ESP_TEST_RAW_TP_ESP_TO_HOST) || !header)
 		return;
 
 	offset = esp_wire_le16_to_cpu(header->offset);
-	if (len >= offset + sizeof(struct raw_tp_packet)) {
+	if (len >= sizeof(struct raw_tp_packet)) {
 		tp_pkt = (const struct raw_tp_packet *)((const u8 *)header + offset);
 		seq = esp_wire_le32_to_cpu(tp_pkt->seq);
 		run_id = esp_wire_le32_to_cpu(tp_pkt->run_id);
@@ -354,6 +435,18 @@ void update_test_raw_tp_rx_stats(const struct esp_payload_header *header,
 
 	if (run_id != host_raw_tp_run_id)
 		return;
+
+	payload_valid = len == TEST_RAW_TP__BUF_SIZE &&
+		raw_tp_pattern_valid((const u8 *)header + offset, len, seq, run_id);
+	spin_lock_bh(&raw_tp_rx_stats_lock);
+	/* An old RX worker may have passed the first check before teardown. */
+	if (!READ_ONCE(log_raw_tp_stats_timer_running) ||
+	    run_id != host_raw_tp_run_id)
+		goto out;
+	if (!payload_valid) {
+		raw_tp_rx_bad_payload++;
+		goto out;
+	}
 
 	diff = (s32)(seq - raw_tp_rx_expected_seq);
 	raw_tp_rx_total++;
@@ -414,6 +507,8 @@ void update_test_raw_tp_rx_stats(const struct esp_payload_header *header,
 	} else {
 		raw_tp_rx_dup++;
 	}
+out:
+	spin_unlock_bh(&raw_tp_rx_stats_lock);
 }
 #endif
 
@@ -421,6 +516,8 @@ void process_test_capabilities(u32 raw_tp_mode)
 {
 #if TEST_RAW_TP
 	stop_test_raw_tp();
+	/* Stop old producers/timers before resetting a new run. */
+	test_raw_tp_cleanup();
 	if (!host_raw_tp_run_id)
 		host_raw_tp_run_id = 1;
 	raw_tp_reset_stats();

@@ -41,6 +41,7 @@ nav:
       - Performance: reference/performance.md
       - Repository layout: reference/repository-layout.md
       - Raspberry Pi reference setup: reference/raspberry-pi.md
+      - Raspberry Pi 5 SPI-HD / QSPI: rpi5-spi-hd-qio.md
   - Porting: porting.md
   - Troubleshooting: troubleshooting.md
   - Migration: migration.md

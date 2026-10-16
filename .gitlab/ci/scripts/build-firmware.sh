@@ -1,13 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-IDF_TARGET="${1:?Usage: build-firmware.sh <idf-target> <sdio|spi|usb>}"
-TRANSPORT="${2:?Usage: build-firmware.sh <idf-target> <sdio|spi|usb>}"
+IDF_TARGET="${1:?Usage: build-firmware.sh <idf-target> <sdio|spi|spi_hd|usb>}"
+TRANSPORT="${2:?Usage: build-firmware.sh <idf-target> <sdio|spi|spi_hd|usb>}"
 
-[[ "$TRANSPORT" == "sdio" || "$TRANSPORT" == "spi" || "$TRANSPORT" == "usb" ]] || {
-    echo "ERROR: transport must be sdio, spi or usb" >&2
+[[ "$TRANSPORT" == "sdio" || "$TRANSPORT" == "spi" || "$TRANSPORT" == "spi_hd" || "$TRANSPORT" == "usb" ]] || {
+    echo "ERROR: transport must be sdio, spi, spi_hd or usb" >&2
     exit 2
 }
+
+# Slave-HD/QIO requires v2 silicon support. ESP32 lacks that peripheral;
+# all other listed Wi-Fi targets in the pinned IDF support the v2 block.
+if [[ "$TRANSPORT" == "spi_hd" ]]; then
+    case "$IDF_TARGET" in
+        esp32s2|esp32s3|esp32c2|esp32c3|esp32c5|esp32c6|esp32c61|esp32s31) ;;
+        *) echo "ERROR: SPI-HD is not supported for $IDF_TARGET" >&2; exit 2 ;;
+    esac
+fi
 
 if [[ "$TRANSPORT" == "usb" && "$IDF_TARGET" != "esp32s31" ]]; then
     echo "ERROR: USB transport is supported only for esp32s31" >&2
@@ -93,6 +102,33 @@ if [[ "$TRANSPORT" == "spi" ]]; then
     else
         SDK_DEFAULTS="sdkconfig.defaults;sdkconfig.ci"
     fi
+elif [[ "$TRANSPORT" == "spi_hd" ]]; then
+    # Check against the *pinned* ESP-IDF's silicon capabilities, not a
+    # blanket assumption that every SPI peripheral supports quad slave mode.
+    caps="$IDF_PATH/components/soc/$IDF_TARGET/include/soc/soc_caps.h"
+    [[ -s "$caps" ]] && grep -Eq '^#define[[:space:]]+SOC_SPI_SUPPORT_SLAVE_HD_VER2[[:space:]]+1' "$caps" || {
+        echo "ERROR: pinned IDF lacks Slave-HD v2 for $IDF_TARGET" >&2
+        exit 1
+    }
+    [[ -s sdkconfig.ci.spi_hd ]] || {
+        echo "ERROR: missing common SPI-HD Kconfig profile" >&2
+        exit 1
+    }
+    SDK_DEFAULTS="sdkconfig.defaults;sdkconfig.ci.spi_hd"
+    if [[ "$IDF_TARGET" == "esp32c5" ]]; then
+        # Preserve the already physically tested Pi5/C5 pin and DMA profile.
+        [[ -s sdkconfig.ci.spi_hd.esp32c5 ]] || {
+            echo "ERROR: missing C5 hardware-qualified SPI-HD profile" >&2
+            exit 1
+        }
+        SDK_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32c5;sdkconfig.ci.spi_hd;sdkconfig.ci.spi_hd.esp32c5"
+    elif [[ "$IDF_TARGET" == "esp32s31" ]]; then
+        [[ -s sdkconfig.defaults.esp32s31 ]] || {
+            echo "ERROR: missing ESP32-S31 base defaults" >&2
+            exit 1
+        }
+        SDK_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32s31;sdkconfig.ci.spi_hd"
+    fi
 elif [[ "$TRANSPORT" == "usb" ]]; then
     [[ -f sdkconfig.defaults.esp32s31_usb ]] || {
         echo "ERROR: sdkconfig.defaults.esp32s31_usb is required for USB" >&2
@@ -124,6 +160,19 @@ idf.py "${IDF_PREVIEW_ARGS[@]}" \
     build
 
 test -s build/network_adapter.bin
+
+if [[ "$TRANSPORT" == "spi_hd" ]]; then
+    grep -qx "CONFIG_ESP_SPI_HD_HOST_INTERFACE=y" sdkconfig || {
+        echo "ERROR: $IDF_TARGET firmware build did not select SPI-HD transport" >&2
+        exit 1
+    }
+    if [[ "$IDF_TARGET" == "esp32c5" ]]; then
+        grep -qx "CONFIG_ESP_SPI_HD_RX_SEGMENT_SIZE=3200" sdkconfig || {
+            echo "ERROR: C5 Pi5-qualified SPI-HD segment configuration not applied" >&2
+            exit 1
+        }
+    fi
+fi
 
 mkdir -p "$ARTIFACT_DIR"
 

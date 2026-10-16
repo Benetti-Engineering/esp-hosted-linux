@@ -29,6 +29,8 @@ void esp_raw_tp_tx_complete(u32 run_id, u32 frame_count);
 void esp_raw_tp_tx_failed(u32 frame_count);
 u32 esp_raw_tp_alloc_run_id(void);
 u32 esp_raw_tp_get_run_id(void);
+/* Start the H2E producer after an E2H receiver has been armed pre-commit. */
+int esp_raw_tp_enable_h2e_tx(void);
 #endif
 
 void test_raw_tp_cleanup(void);

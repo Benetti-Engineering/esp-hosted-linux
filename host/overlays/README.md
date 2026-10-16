@@ -146,3 +146,14 @@ verify reset direction electrically before enabling runtime reset control.
 Other hosts should likewise describe the ESP node under their own SPI
 controller and use their platform's native pinctrl binding rather than copying
 the Raspberry Pi `brcm,*` pinctrl properties.
+
+
+## Raspberry Pi 5 SPI-HD/QIO
+
+Use `esp32-spi-hd-rpi5.dts` with `compatible = "espressif,esp32-spi-hd"`.
+The RP1 controller needs quad support; build the controller modules with
+`bash rpi5_spi_hd/build-rp1-quad-modules.sh --load`. The QSPI transport uses
+D0–D3, CLK, CS and Data Ready; it does not use the full-duplex handshake line.
+
+See [QSPI setup and tested profile](../../docs/rpi5-spi-hd-qio.md) for wiring,
+firmware configuration, runtime setup and qualification scope.

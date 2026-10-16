@@ -70,6 +70,7 @@ typedef enum {
     SDIO = 0,
     SPI = 1,
     USB = 2,
+    SPI_HD = 3,
 } transport_layer;
 
 typedef enum {

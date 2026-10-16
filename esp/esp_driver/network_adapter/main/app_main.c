@@ -378,7 +378,7 @@ static int wifi_tx_with_retry(wifi_interface_t wifi_if, uint8_t *payload,
     return ret;
 }
 
-#if CONFIG_ESP_SPI_HOST_INTERFACE
+#if CONFIG_ESP_SPI_HOST_INTERFACE || CONFIG_ESP_SPI_HD_HOST_INTERFACE
 #ifdef CONFIG_IDF_TARGET_ESP32S2
 #define TO_HOST_QUEUE_SIZE      5
 #else
@@ -993,7 +993,10 @@ static uint32_t get_capabilities()
     uint32_t cap = 0;
 
     ESP_LOGI(TAG, "Supported features are:");
-#if CONFIG_ESP_SPI_HOST_INTERFACE
+#if CONFIG_ESP_SPI_HD_HOST_INTERFACE
+    ESP_LOGI(TAG, "- WLAN over SPI half-duplex/QIO");
+    cap |= ESP_WLAN_SPI_SUPPORT;
+#elif CONFIG_ESP_SPI_HOST_INTERFACE
     ESP_LOGI(TAG, "- WLAN over SPI");
     cap |= ESP_WLAN_SPI_SUPPORT;
 #elif CONFIG_ESP_USB_HOST_INTERFACE
@@ -1014,7 +1017,7 @@ static uint32_t get_capabilities()
     cap |= ESP_WLAN_GCMP_SUPPORT;
 #endif
 
-#if CONFIG_ESP_SPI_CHECKSUM || CONFIG_ESP_SDIO_CHECKSUM
+#if CONFIG_ESP_SPI_CHECKSUM || CONFIG_ESP_SPI_HD_CHECKSUM || CONFIG_ESP_SDIO_CHECKSUM
     cap |= ESP_CHECKSUM_ENABLED;
 #endif
 
@@ -1257,7 +1260,7 @@ void process_tx_pkt(interface_buffer_handle_t *buf_handle)
             ESP_LOGD(TAG, "CMD_RESP_TRANSPORT_OK code=%u seq=%u bytes=%"PRId32,
                      cmd_code, cmd_seq, ret);
         }
-#if !CONFIG_ESP_SPI_HOST_INTERFACE
+#if !CONFIG_ESP_SPI_HOST_INTERFACE && !CONFIG_ESP_SPI_HD_HOST_INTERFACE
         if (raw_tp_frame) {
             if (ret == (int32_t)buf_handle->payload_len) {
                 debug_raw_tp_tx_complete(1);

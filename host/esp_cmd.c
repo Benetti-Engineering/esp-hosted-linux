@@ -790,7 +790,8 @@ static bool esp_cmd_is_admitted(struct esp_adapter *adapter, u8 cmd_code)
 		       cmd_code == CMD_START_OTA_WRITE ||
 		       cmd_code == CMD_START_OTA_END ||
 		       cmd_code == CMD_RAW_TP_ESP_TO_HOST ||
-		       cmd_code == CMD_RAW_TP_HOST_TO_ESP;
+		       cmd_code == CMD_RAW_TP_HOST_TO_ESP ||
+		       cmd_code == CMD_RAW_TP_BIDIRECTIONAL;
 	if (test_bit(ESP_CLEANUP_IN_PROGRESS, &adapter->state_flags))
 		return cmd_code == CMD_DEINIT_INTERFACE &&
 		       test_bit(ESP_ALLOW_DEINIT, &adapter->state_flags);
@@ -1168,6 +1169,7 @@ static bool esp_cmd_timeout_is_commit_ambiguous(u8 cmd_code)
 	case CMD_SET_REG_DOMAIN:
 	case CMD_RAW_TP_ESP_TO_HOST:
 	case CMD_RAW_TP_HOST_TO_ESP:
+	case CMD_RAW_TP_BIDIRECTIONAL:
 	case CMD_SET_WOW_CONFIG:
 	case CMD_SET_MODE:
 	case CMD_SET_IE:
@@ -1386,6 +1388,7 @@ static int wait_and_decode_cmd_resp(struct esp_wifi_device *priv,
 	case CMD_SET_REG_DOMAIN:
 	case CMD_RAW_TP_ESP_TO_HOST:
 	case CMD_RAW_TP_HOST_TO_ESP:
+	case CMD_RAW_TP_BIDIRECTIONAL:
 	case CMD_SET_WOW_CONFIG:
 	case CMD_SET_TIME:
 	case CMD_START_OTA_UPDATE:
@@ -3591,6 +3594,13 @@ int cmd_init_raw_tp_task_timer(struct esp_wifi_device *priv)
 		cmd_node = prepare_command_request(priv->adapter, CMD_RAW_TP_ESP_TO_HOST, cmd_len);
 	} else if (raw_tp_mode == ESP_TEST_RAW_TP_HOST_TO_ESP) {
 		cmd_node = prepare_command_request(priv->adapter, CMD_RAW_TP_HOST_TO_ESP, cmd_len);
+	} else if (raw_tp_mode == (ESP_TEST_RAW_TP_ESP_TO_HOST |
+				       ESP_TEST_RAW_TP_HOST_TO_ESP)) {
+		/* One firmware command starts both counters/flows atomically. */
+		cmd_node = prepare_command_request(priv->adapter,
+				CMD_RAW_TP_BIDIRECTIONAL, cmd_len);
+	} else {
+		return -EINVAL;
 	}
 
 	if (IS_ERR_OR_NULL(cmd_node))
@@ -3600,6 +3610,13 @@ int cmd_init_raw_tp_task_timer(struct esp_wifi_device *priv)
 				    sizeof(struct esp_payload_header));
 	cmd->run_id = esp_wire_cpu_to_le32(run_id);
 
+	/* Firmware may emit seq0 immediately after replying. Arm the E2H
+	 * receiver before publication, while reconstruction keeps H2E closed.
+	 */
+#if TEST_RAW_TP
+	if (raw_tp_mode & ESP_TEST_RAW_TP_ESP_TO_HOST)
+		process_test_capabilities(ESP_TEST_RAW_TP_ESP_TO_HOST);
+#endif
 	queue_cmd_node(priv->adapter, cmd_node, ESP_CMD_DFLT_PRIO);
 
 	RET_ON_FAIL(wait_and_decode_cmd_resp(priv, cmd_node));

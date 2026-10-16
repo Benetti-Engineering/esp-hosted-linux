@@ -1,0 +1,515 @@
+spi: dw: stream enhanced quad frames through DMA
+
+The DesignWare enhanced transfer path requires quad writes to fit in
+the TX FIFO. This prevents larger transfers from using DMA, while quad
+reads also need their full instruction and address controls queued
+before the first clock to avoid ending a frame prematurely.
+
+Allow DMA-backed enhanced quad transfers beyond the FIFO capacity.
+For TX, hold native chip select inactive while priming the FIFO with
+the control words and a bounded payload prefix. Build a DMA tail
+from the remaining bytes of the SPI core's mapped scatterlist, then
+resume the frame after the descriptor is armed. For RX, preload all
+enhanced control words before starting the receive clocks.
+
+Preserve chip-select boundaries and SPI mode 3 idle-clock behavior.
+Reject unsupported external chip-select paths, enhanced-write dummy
+clocks and unsafe DMA widths or alignments rather than transmitting
+an incomplete frame. Ordinary single-line SPI transfers retain
+their existing execution path.
+
+This change depends on the enhanced quad support in Raspberry Pi
+Linux PR #7587 (81a76dd2284e09547cc5a9eeb88b174fea5a819a).
+
+diff --git a/drivers/spi/spi-dw-core.c b/drivers/spi/spi-dw-core.c
+--- a/drivers/spi/spi-dw-core.c
++++ b/drivers/spi/spi-dw-core.c
+@@ -444,7 +444,7 @@
+ 		/* The control words are consumed and must not be repeated */
+ 		memset(&dws->enh, 0, sizeof(dws->enh));
+ 
+-		if (dws->tx_len)
++		if (dws->tx_len && !dws->dma_mapped)
+ 			dw_writer(dws);
+ 	} else if (!dws->tx_len) {
+ 		dw_writel(dws, DW_SPI_DR, 0);
+@@ -457,9 +457,15 @@
+ {
+ 	struct spi_transfer *next = xfer;
+ 
+-	list_for_each_entry_continue(next, &host->cur_msg->transfers, transfer_list)
++	/* Only collect control words inside the same CS frame. */
++	if (xfer->cs_change)
++		return false;
++	list_for_each_entry_continue(next, &host->cur_msg->transfers, transfer_list) {
+ 		if (next->tx_nbits > 1 || next->rx_nbits > 1)
+ 			return true;
++		if (next->cs_change)
++			return false;
++	}
+ 
+ 	return false;
+ }
+@@ -534,8 +540,21 @@
++	/* This implementation relies on native SER to prefill controls
++	 * without starting an incomplete CS frame. The external-CS
++	 * enhanced DMA variant needs separate qualification.
++	 */
++	if (dws->dma_mapped && !dw_readl(dws, DW_SPI_SER))
++		return -EOPNOTSUPP;
++
+ 	if (!dws->enh.ctrl_len)
+ 		return -EINVAL;
+ 
+-	/* The control words are byte sized, so DFS has to be 8 */
+-	if (dws->n_bytes != 1)
++	/* Instruction/address lengths are specified independently in
++	 * SPI_CTRLR0. Allow mapped 16/32-bit data with supported DMA widths.
++	 */
++	if (dws->n_bytes != 1 &&
++	    !((dws->n_bytes == 2 || dws->n_bytes == 4) &&
++	      dws->dma_mapped &&
++	      (cfg->tmode == DW_SPI_CTRLR0_TMOD_TO ||
++	       cfg->tmode == DW_SPI_CTRLR0_TMOD_RO)))
+ 		return -EINVAL;
+ 
+ 	/* There is no full duplex enhanced frame */
+@@ -543,10 +562,23 @@
+ 	    cfg->tmode != DW_SPI_CTRLR0_TMOD_TO)
+ 		return -EINVAL;
+ 
++	/* Enhanced-write WAIT_CYCLES are unsupported: never silently omit
++	 * the requested dummy phase of a flash or other QSPI peripheral.
++	 */
++	if (cfg->tmode == DW_SPI_CTRLR0_TMOD_TO && dws->enh.cfg.wait_l)
++		return -EOPNOTSUPP;
++
+ 	/* A write ends when the Tx FIFO drains, so all of it has to fit */
++	/* above-FIFO quad is accepted ONLY
++	 * if the SPI core mapped the transfer for an available TX DMA.
++	 * The DMA path holds native SER low until TX FIFO is primed.
++	 */
+ 	if (cfg->tmode == DW_SPI_CTRLR0_TMOD_TO &&
+-	    dws->tx_len + dws->enh.ctrl_len > dws->fifo_len)
+-		return -EINVAL;
++	    dws->tx_len + dws->enh.ctrl_len > dws->fifo_len) {
++		if (!(dws->dma_mapped && dws->txchan && dws->host->dma_tx)) {
++			return -EOPNOTSUPP;
++		}
++	}
+ 
+ 	cfg->enh_frf = DW_SPI_CTRLR0_ENH_FRF_QUAD;
+ 
+@@ -638,6 +670,9 @@
+ 	int buswidth;
+ 	int ret;
+ 
++	u32 idle_ser = 0;
++	bool mode3_frame;
++
+ 	/* Start the message with no frame collected */
+ 	if (list_is_first(&transfer->transfer_list, &host->cur_msg->transfers))
+ 		memset(&dws->enh, 0, sizeof(dws->enh));
+@@ -646,8 +681,9 @@
+ 	if (dw_spi_enh_data_pending(host, transfer))
+ 		return dw_spi_collect_enh_xfer(dws, transfer);
+ 
+-	dws->dma_mapped = 0;
++	/* Determine DMA before enhanced-FIFO bounds validation. */
+ 	dws->n_bytes = spi_bpw_to_bytes(transfer->bits_per_word);
++	dws->dma_mapped = spi_xfer_is_dma_mapped(host, spi, transfer);
+ 	dws->tx = (void *)transfer->tx_buf;
+ 	dws->tx_len = transfer->len / dws->n_bytes;
+ 	dws->rx = transfer->rx_buf;
+@@ -673,6 +709,18 @@
+ 	/* Ensure the data above is visible for all CPUs */
+ 	smp_mb();
+ 
++	/* Native CS must be inactive while establishing MODE3's idle-high
++	 * clock. Only touch frame boundaries, never a continuous SIO read's
++	 * header/data boundary. Enhanced control words have not clocked yet.
++	 */
++	/* Never modify native-CS timing for unrelated single-line clients. */
++	mode3_frame = buswidth > 1 && dws->enh.ctrl_len &&
++		(spi->mode & (SPI_CPOL | SPI_CPHA)) ==
++		(SPI_CPOL | SPI_CPHA);
++	if (mode3_frame) {
++		idle_ser = dw_readl(dws, DW_SPI_SER);
++		dw_writel(dws, DW_SPI_SER, 0);
++	}
+ 	dw_spi_enable_chip(dws, 0);
+ 
+ 	dw_spi_update_config(dws, spi, &cfg,
+@@ -680,19 +728,23 @@
+ 
+ 	transfer->effective_speed_hz = dws->current_freq;
+ 
+-	/* Check if current transfer is a DMA transaction */
+-	dws->dma_mapped = spi_xfer_is_dma_mapped(host, spi, transfer);
++	/* The DMA mapping was validated before enhanced frame admission. */
+ 
+ 	/* For poll mode just disable all interrupts */
+ 	dw_spi_mask_intr(dws, 0xff);
+ 
+ 	if (dws->dma_mapped) {
+ 		ret = dws->dma_ops->dma_setup(dws, transfer);
++		if (ret && mode3_frame)
++			dw_writel(dws, DW_SPI_SER, idle_ser);
+ 		if (ret)
+ 			return ret;
+ 	}
+ 
+ 	dw_spi_enable_chip(dws, 1);
++	if (mode3_frame) {
++		dw_writel(dws, DW_SPI_SER, idle_ser);
++	}
+ 
+ 	if (dws->dma_mapped)
+ 		return dws->dma_ops->dma_transfer(dws, transfer);
+@@ -759,6 +811,10 @@
+ 	if (op->data.dir == SPI_MEM_DATA_OUT && op->data.buswidth > 1 &&
+ 	    dws->fifo_len <= DW_SPI_ENH_CTRL_ENTRIES)
+ 		return false;
++	/* Unsupported enhanced-write dummy clocks: reject early for spi-mem. */
++	if (op->data.dir == SPI_MEM_DATA_OUT && op->data.buswidth == 4 &&
++	    op->dummy.nbytes)
++		return false;
+ 
+ 	return spi_mem_default_supports_op(mem, op);
+ }
+diff --git a/drivers/spi/spi-dw-dma.c b/drivers/spi/spi-dw-dma.c
+--- a/drivers/spi/spi-dw-dma.c
++++ b/drivers/spi/spi-dw-dma.c
+@@ -14,6 +14,9 @@
+ #include <linux/module.h>
+ #include <linux/pci.h>
+ #include <linux/platform_data/dma-dw.h>
++#include <linux/dma-mapping.h>
++#include <linux/scatterlist.h>
++#include <linux/slab.h>
+ #include <linux/spi/spi.h>
+ #include <linux/types.h>
+ 
+@@ -248,11 +251,24 @@
+ {
+ 	struct dw_spi *dws = spi_controller_get_devdata(host);
+ 	enum dma_slave_buswidth dma_bus_width;
++	unsigned int nbytes = spi_bpw_to_bytes(xfer->bits_per_word);
++	unsigned int fifo_words = dws->fifo_len;
+ 
+-	if (xfer->len <= dws->fifo_len)
++	if (!nbytes)
+ 		return false;
++	/* DMA capacity is measured in FIFO words, not SPI wire bytes.
++	 * Reserve instruction/address FIFO entries on enhanced quad writes.
++	 */
++	if (xfer->tx_buf && xfer->tx_nbits == SPI_NBITS_QUAD) {
++		/* Enhanced instruction/address may consume two FIFO words. */
++		if (fifo_words <= 2)
++			return false;
++		fifo_words -= 2;
++	}
++	if (xfer->len <= fifo_words * nbytes)
++		return false;
+ 
+-	dma_bus_width = dw_spi_dma_convert_width(dws->n_bytes);
++	dma_bus_width = dw_spi_dma_convert_width(nbytes);
+ 
+ 	return dws->dma_addr_widths & BIT(dma_bus_width);
+ }
+@@ -294,7 +310,8 @@
+ 
+ 	nents = dw_readl(dws, DW_SPI_TXFLR);
+ 	delay.unit = SPI_DELAY_UNIT_SCK;
+-	delay.value = nents * dws->n_bytes * BITS_PER_BYTE;
++	delay.value = DIV_ROUND_UP(nents * dws->n_bytes * BITS_PER_BYTE,
++				   xfer->tx_nbits ?: 1);
+ 
+ 	while (dw_spi_dma_tx_busy(dws) && retry--)
+ 		spi_delay_exec(&delay, xfer);
+@@ -305,7 +322,8 @@
+ 	}
+ 
+ 	if (!xfer->rx_buf) {
+-		delay.value = dws->n_bytes * BITS_PER_BYTE;
++		delay.value = DIV_ROUND_UP(dws->n_bytes * BITS_PER_BYTE,
++					   xfer->tx_nbits ?: 1);
+ 		while (dw_readl(dws, DW_SPI_SR) & DW_SPI_SR_BUSY)
+ 			spi_delay_exec(&delay, xfer);
+ 	}
+@@ -494,7 +512,11 @@
+ 		dma_ctrl |= DW_SPI_DMACR_TDMAE;
+ 	if (xfer->rx_buf)
+ 		dma_ctrl |= DW_SPI_DMACR_RDMAE;
+-	dw_writel(dws, DW_SPI_DMACR, dma_ctrl);
++	/* prevent an empty-FIFO request from being latched before
++	 * the CPU prefix is loaded. Enable TX requests only after SER.
++	 */
++	dw_writel(dws, DW_SPI_DMACR,
++		   xfer->tx_buf && dws->enh.ctrl_len ? 0 : dma_ctrl);
+ 
+ 	/* Set the interrupt mask */
+ 	imr = 0;
+@@ -511,14 +533,150 @@
+ 	return 0;
+ }
+ 
++static int dw_spi_start_quad_rx_frame(struct dw_spi *dws)
++{
++	u32 saved_ser = dw_readl(dws, DW_SPI_SER);
++	unsigned int control_words = dws->enh.ctrl_len;
++
++	/* Both control entries must be present before the first wire clock.
++	 * Native CS can otherwise end an enhanced frame if an IRQ separates
++	 * the instruction and address FIFO writes. RX DMA is already armed.
++	 */
++	if (!saved_ser)
++		return -EOPNOTSUPP; /* Native chip-select required for FIFO prefill */
++	if (!control_words || control_words > dws->fifo_len ||
++	    dw_readl(dws, DW_SPI_TXFLR))
++		return -EINVAL;
++	dw_writel(dws, DW_SPI_SER, 0);
++	dw_spi_start_frame(dws);
++	if (dw_readl(dws, DW_SPI_TXFLR) != control_words) {
++		pr_err("spi-dw: quad RX control prefill not retained: want=%u got=%u\n",
++		       control_words, dw_readl(dws, DW_SPI_TXFLR));
++		/* Drop the incomplete FIFO frame with native CS inactive. */
++		dw_spi_enable_chip(dws, 0);
++		dw_writel(dws, DW_SPI_SER, saved_ser);
++		return -EIO;
++	}
++	dw_writel(dws, DW_SPI_SER, saved_ser);
++	return 0;
++}
++
+ static int dw_spi_dma_transfer_all(struct dw_spi *dws,
+ 				   struct spi_transfer *xfer)
+ {
+ 	int ret;
++	bool quad_dma = xfer->tx_buf && dws->enh.ctrl_len;
+ 
++	struct scatterlist tx_tail_one;
++	struct scatterlist *tx_tail = NULL;
++	struct scatterlist *tx_sg = xfer->tx_sg.sgl;
++	struct scatterlist *sg;
++	unsigned int tx_nents = xfer->tx_sg.nents;
++	unsigned int tail_nents = 0;
++	unsigned int tail_bytes = 0;
++	unsigned int skip;
++	bool tail_allocated = false;
++	bool ser_gated = false;
++	unsigned int prime_bytes = 0;
++	unsigned int expected_fill = 0;
++	unsigned int i;
++	const u8 *src = xfer->tx_buf;
++	u32 saved_ser = 0;
++
++
++	/* isolated enhanced TX only. Fill
++	 * all available FIFO entries before SCLK and request DMA refill as
++	 * soon as a burst fits. The default low watermark leaves too little
++	 * time at four-line speed, allowing the enhanced frame to end early.
++	 * Use only the mapped tail; reject unsupported layouts.
++	 */
++	if (quad_dma) {
++		if ((dws->n_bytes != 1 && dws->n_bytes != 2 &&
++		     dws->n_bytes != 4) || !tx_nents ||
++		    dws->enh.ctrl_len >= dws->fifo_len ||
++		    !dws->txburst || dws->txburst >= dws->fifo_len) {
++			pr_err("spi-dw: quad DMA prefix rejected: len=%u nents=%u fifo=%u\n",
++			       xfer->len, tx_nents, dws->fifo_len);
++			ret = -EINVAL;
++			goto err_clear_dmac;
++		}
++		/* The SPI core maps before collecting control words. Conservatively
++		 * reserving two control entries can select DMA for a one-control
++		 * frame which also fits in the FIFO. Streaming it is valid.
++		 */
++		/* Always leave at least one complete word for the DMA tail. */
++		if (xfer->len % dws->n_bytes || xfer->len <= dws->n_bytes) {
++			ret = -EINVAL;
++			goto err_clear_dmac;
++		}
++		prime_bytes = min_t(unsigned int,
++					min_t(unsigned int,
++					      dws->fifo_len - dws->enh.ctrl_len,
++					      dws->n_bytes == 4 ? 16 : dws->fifo_len) *
++					      dws->n_bytes,
++					xfer->len - dws->n_bytes);
++		if (!prime_bytes) {
++			ret = -EINVAL;
++			goto err_clear_dmac;
++		}
++		expected_fill = prime_bytes / dws->n_bytes + dws->enh.ctrl_len;
++		dw_writel(dws, DW_SPI_DMATDLR, dws->fifo_len - dws->txburst);
++		/*
++		 * The SPI core may map the TX buffer to any valid SG layout.
++		 * Remove the FIFO-prefilled prefix without assuming one mapped
++		 * DMA segment: preserve the remaining mapped segments and their
++		 * original DMA addresses. No ESP peripheral assumptions here.
++		 */
++		/* Keep the qualified single-SG hot path allocation-free. */
++		if (tx_nents == 1) {
++			tx_tail = &tx_tail_one;
++		} else {
++			tx_tail = kcalloc(tx_nents, sizeof(*tx_tail), GFP_KERNEL);
++			if (!tx_tail) {
++				ret = -ENOMEM;
++				goto err_clear_dmac;
++			}
++			tail_allocated = true;
++		}
++		sg_init_table(tx_tail, tx_nents);
++		skip = prime_bytes;
++		for_each_sg(xfer->tx_sg.sgl, sg, tx_nents, i) {
++			unsigned int nbytes = sg_dma_len(sg);
++
++			if (skip >= nbytes) {
++				skip -= nbytes;
++				continue;
++			}
++			sg_dma_address(&tx_tail[tail_nents]) =
++				sg_dma_address(sg) + skip;
++			sg_dma_len(&tx_tail[tail_nents]) = nbytes - skip;
++			tail_bytes += nbytes - skip;
++			tail_nents++;
++			skip = 0;
++		}
++		if (skip || !tail_nents ||
++		    tail_bytes != xfer->len - prime_bytes) {
++			ret = -EINVAL;
++			goto err_clear_dmac;
++		}
++		/* A DMA engine can require every mapped SG segment to align
++		 * to the configured 8/16/32-bit peripheral data width.
++		 */
++		for (i = 0; i < tail_nents; i++) {
++			if (!IS_ALIGNED(sg_dma_address(&tx_tail[i]), dws->n_bytes) ||
++			    !IS_ALIGNED(sg_dma_len(&tx_tail[i]), dws->n_bytes)) {
++				ret = -EINVAL;
++				goto err_clear_dmac;
++			}
++		}
++		sg_mark_end(&tx_tail[tail_nents - 1]);
++		tx_sg = tx_tail;
++		tx_nents = tail_nents;
++	}
++
+ 	/* Submit the DMA Tx transfer if required */
+ 	if (xfer->tx_buf) {
+-		ret = dw_spi_dma_submit_tx(dws, xfer->tx_sg.sgl, xfer->tx_sg.nents);
++		ret = dw_spi_dma_submit_tx(dws, tx_sg, tx_nents);
+ 		if (ret)
+ 			goto err_clear_dmac;
+ 	}
+@@ -533,20 +691,107 @@
+ 		dma_async_issue_pending(dws->rxchan);
+ 	}
+ 
++	/* native SER prevents any wire clocks
++	 * while the CPU loads control and first payload entries. DMAC is
++	 * submitted for *only the unprimed tail*. Resume SER only after DMA
++	 * is armed, allowing TX FIFO threshold-driven DMA to begin.
++	 */
++	if (quad_dma) {
++		saved_ser = dw_readl(dws, DW_SPI_SER);
++		if (!saved_ser) {
++			/* This prefill mechanism cannot maintain an enhanced
++			 * frame across an unqualified GPIO/externally held CS.
++			 */
++			ret = -EOPNOTSUPP;
++			goto err_clear_dmac;
++		}
++		dw_writel(dws, DW_SPI_SER, 0);
++		ser_gated = true;
++		dw_spi_start_frame(dws);
++		/* SPI core handed this streaming mapping to the DMA device
++		 * before transfer_one. The DMA descriptor is submitted but
++		 * has not been issued: transfer CPU ownership back while
++		 * copying the prefix into the hardware FIFO.
++		 */
++		dma_sync_sgtable_for_cpu(dws->host->cur_tx_dma_dev,
++					 &xfer->tx_sg, DMA_TO_DEVICE);
++		for (i = 0; i < prime_bytes; i += dws->n_bytes) {
++			u32 word = 0;
++			/* Preserve native-endian FIFO order for 8/16/32-bit words. */
++			memcpy(&word, src + i, dws->n_bytes);
++			dw_write_io_reg(dws, DW_SPI_DR, word);
++		}
++		dma_sync_sgtable_for_device(dws->host->cur_tx_dma_dev,
++					    &xfer->tx_sg, DMA_TO_DEVICE);
++		if (dw_readl(dws, DW_SPI_TXFLR) != expected_fill) {
++			pr_err("spi-dw: quad DMA PIO prefill not retained: want=%u got=%u\n",
++			       expected_fill, dw_readl(dws, DW_SPI_TXFLR));
++			ret = -EIO;
++			goto err_clear_dmac;
++		}
++		dws->tx = (u8 *)dws->tx + prime_bytes;
++		dws->tx_len -= prime_bytes / dws->n_bytes;
++	}
+ 	if (xfer->tx_buf) {
+ 		dma_async_issue_pending(dws->txchan);
++		if (quad_dma) {
++			dw_writel(dws, DW_SPI_SER, saved_ser);
++			ser_gated = false;
++			dw_writel(dws, DW_SPI_DMACR, DW_SPI_DMACR_TDMAE);
++		}
+ 	} else {
+-		/* Pause to allow DMA channel to fetch RX descriptor */
++
++		/* Use the unchanged upstream DMA descriptor arm interval.
++		 * SG count and word width alone are no hardware-ready signal.
++		 */
+ 		usleep_range(5, 10);
+ 
+-		/* Write something to the TX FIFO to start the transfer */
+-		dw_spi_start_frame(dws);
++		/* Complete enhanced RX controls before allowing wire clocks. */
++		if (xfer->rx_nbits == SPI_NBITS_QUAD && dws->enh.ctrl_len) {
++			ret = dw_spi_start_quad_rx_frame(dws);
++			if (ret)
++				goto err_clear_dmac;
++		} else {
++			dw_spi_start_frame(dws);
++		}
+ 	}
+ 
+ 	ret = dw_spi_dma_wait(dws, xfer->len, xfer->effective_speed_hz);
++	/* The error IRQ also completes the DMA wait object. A wake-up does
++	 * not guarantee that either DMA channel stopped touching the
++	 * temporary tail SG; distinguish normal callbacks from early IRQ.
++	 */
++	if (!ret && dws->host->cur_msg &&
++	    dws->host->cur_msg->status != -EINPROGRESS)
++		ret = dws->host->cur_msg->status ?: -EIO;
++	if (!ret && (test_bit(DW_SPI_TX_BUSY, &dws->dma_chan_busy) ||
++		     test_bit(DW_SPI_RX_BUSY, &dws->dma_chan_busy)))
++		ret = -EIO;
+ 
+ err_clear_dmac:
+ 	dw_writel(dws, DW_SPI_DMACR, 0);
++	/* Terminate every unfinished DMA channel synchronously before
++	 * freeing the descriptor on error / early controller interrupt.
++	 */
++	if (ret) {
++		if (test_bit(DW_SPI_TX_BUSY, &dws->dma_chan_busy)) {
++			dmaengine_terminate_sync(dws->txchan);
++			clear_bit(DW_SPI_TX_BUSY, &dws->dma_chan_busy);
++		}
++		if (test_bit(DW_SPI_RX_BUSY, &dws->dma_chan_busy)) {
++			dmaengine_terminate_sync(dws->rxchan);
++			clear_bit(DW_SPI_RX_BUSY, &dws->dma_chan_busy);
++		}
++	}
++	if (ser_gated) {
++		/* Never clock out an incomplete FIFO prefix on error. */
++		dw_spi_enable_chip(dws, 0);
++		dw_writel(dws, DW_SPI_SER, saved_ser);
++	}
++	if (quad_dma)
++		dw_writel(dws, DW_SPI_DMATDLR, dws->txburst);
++	if (tail_allocated)
++		kfree(tx_tail);
+ 
+ 	return ret;
+ }

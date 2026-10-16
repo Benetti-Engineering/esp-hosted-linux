@@ -48,6 +48,9 @@ build_transport() {
     local ko="esp32_${transport}.ko"
 
     echo "=== Linux ${version} / ${transport^^} ==="
+    # Shared object names are compiled with transport-specific options;
+    # never reuse a previous module\x27s .o files as another transport.
+    make KERNEL="${kernel_dir}" ARCH=x86 clean >/dev/null
     make -j"${HOST_BUILD_JOBS}" KERNEL="${kernel_dir}" ARCH=x86 target="${transport}"
     test -s "$ko"
 
@@ -63,6 +66,7 @@ build_transport() {
 
 build_transport sdio
 build_transport spi
+build_transport spi_hd
 
 {
     echo "series=${KERNEL_SERIES}"
@@ -74,7 +78,9 @@ build_transport spi
     echo "spi_vermagic=$(modinfo -F vermagic "${ARTIFACT_DIR}/esp32_spi.ko")"
     echo "sdio_sha256=$(sha256sum "${ARTIFACT_DIR}/esp32_sdio.ko" | awk '{print $1}')"
     echo "spi_sha256=$(sha256sum "${ARTIFACT_DIR}/esp32_spi.ko" | awk '{print $1}')"
+    echo "spi_hd_vermagic=$(modinfo -F vermagic "${ARTIFACT_DIR}/esp32_spi_hd.ko")"
+    echo "spi_hd_sha256=$(sha256sum "${ARTIFACT_DIR}/esp32_spi_hd.ko" | awk '{print $1}')"
 } > "${ARTIFACT_DIR}/build-info.txt"
 
 cat "${ARTIFACT_DIR}/build-info.txt"
-echo "=== PASS: Linux ${version}, SDIO + SPI ==="
+echo "=== PASS: Linux ${version}, SDIO + SPI + SPI-HD ==="

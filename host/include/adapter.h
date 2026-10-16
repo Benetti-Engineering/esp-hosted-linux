@@ -212,10 +212,11 @@ enum COMMAND_CODE {
 	CMD_STA_SET_AUTHORIZED = 32,
 	CMD_SET_RADIO_SERVICE = 33,
 	CMD_GET_RADIO_SERVICE = 34,
-	/* Pre-initialization, transport-level reboot with an explicit ACK. */
+	/* Keep published master wire IDs unchanged. ID 36 is reserved. */
 	CMD_HOST_REBOOT = 35,
-	/* 36 reserved for AP station list; monitor is 37. */
 	CMD_MONITOR_CONFIG = 37,
+	/* QSPI raw-bidirectional test; new append-only ID after master commands. */
+	CMD_RAW_TP_BIDIRECTIONAL = 38,
 	CMD_MAX,
 };
 
@@ -592,15 +593,33 @@ struct fw_data {
 
 static inline uint16_t compute_checksum(uint8_t *buf, uint16_t len)
 {
-	uint16_t checksum = 0;
-	uint16_t i = 0;
+	uint32_t checksum = 0;
 
-	while (i < len) {
-		checksum += buf[i];
-		i++;
+	while (len && ((unsigned long)buf & 3)) {
+		checksum += *buf++;
+		len--;
 	}
+	while (len >= 4) {
+		uint32_t pairs = 0;
+		unsigned int words = len / 4;
 
-	return checksum;
+		/* Each 16-bit lane sums at most 64 pairs, so carries stay local. */
+		if (words > 64)
+			words = 64;
+		len -= words * 4;
+		while (words--) {
+			uint32_t word;
+
+			__builtin_memcpy(&word, __builtin_assume_aligned(buf, 4), 4);
+			pairs += (word & 0x00ff00ffU) + ((word >> 8) & 0x00ff00ffU);
+			buf += 4;
+		}
+		checksum += (pairs & 0xffffU) + (pairs >> 16);
+	}
+	while (len--)
+		checksum += *buf++;
+
+	return (uint16_t)checksum;
 }
 
 #endif
