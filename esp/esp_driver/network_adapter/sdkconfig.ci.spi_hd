@@ -1,0 +1,10 @@
+# Common compile-only ESP-Hosted SPI Slave-HD (half-duplex/QSPI) profile.
+# Only use on targets with SOC_SPI_SUPPORT_SLAVE_HD_VER2.
+# Kconfig supplies SoC defaults for pins; these are NOT verified board maps.
+CONFIG_ESP_SPI_HD_HOST_INTERFACE=y
+CONFIG_ESP_SPI_HD_MODE=3
+CONFIG_ESP_SPI_HD_CHECKSUM=y
+# Match interim shared SDK defaults for every capable target.
+CONFIG_ESP_SPI_HD_DMA_APPEND=y
+CONFIG_ESP_SPI_HD_TX_BATCH=y
+CONFIG_ESP_SPI_HD_TX_LEN_MIRROR=y
