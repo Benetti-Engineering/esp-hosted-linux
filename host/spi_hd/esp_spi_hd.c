@@ -32,10 +32,14 @@
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/property.h>
+#include <linux/version.h>
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 14, 0)
+#include <linux/sched.h>
+#else
 #include <linux/sched/task_stack.h>
+#endif
 #include <linux/slab.h>
 #include <linux/spi/spi.h>
-#include <linux/version.h>
 #include <linux/workqueue.h>
 
 #include "esp_api.h"
@@ -54,6 +58,59 @@
 /* Older generic controllers clock the explicit zero TX byte as the dummy. */
 #define SPIHD_SET_DUMMY(xfer) do { } while (0)
 #define SPIHD_IS_DUMMY(xfer) 0
+#endif
+
+/*
+ * Generic SPI APIs evolved after Linux 4.9. Keep the compatibility
+ * differences local to this transport; do not change shared host code.
+ */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 14, 0)
+#define SPIHD_CONTROLLER(spi) ((spi)->master)
+#define SPIHD_CTLR_HALF_DUPLEX SPI_MASTER_HALF_DUPLEX
+#define SPIHD_CTLR_NO_TX SPI_MASTER_NO_TX
+#define SPIHD_CTLR_NO_RX SPI_MASTER_NO_RX
+#else
+#define SPIHD_CONTROLLER(spi) ((spi)->controller)
+#define SPIHD_CTLR_HALF_DUPLEX SPI_CONTROLLER_HALF_DUPLEX
+#define SPIHD_CTLR_NO_TX SPI_CONTROLLER_NO_TX
+#define SPIHD_CTLR_NO_RX SPI_CONTROLLER_NO_RX
+#endif
+
+/* spi_is_bpw_supported() first appeared in 5.3. Match its 8-bit
+ * baseline plus controller-advertised widths on older Linux kernels.
+ */
+static bool spihd_bpw_supported(struct spi_device *spi, u32 bpw)
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 3, 0)
+	return spi_is_bpw_supported(spi, bpw);
+#else
+	u32 mask = SPIHD_CONTROLLER(spi)->bits_per_word_mask;
+
+	return bpw == 8 || (bpw && bpw <= 32 && (mask & SPI_BPW_MASK(bpw)));
+#endif
+}
+
+static bool spihd_buf_is_on_stack(const void *buf)
+{
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 4, 0)
+	/* Old object_is_on_stack() takes void * despite only inspecting it. */
+	return object_is_on_stack((void *)buf);
+#else
+	return object_is_on_stack(buf);
+#endif
+}
+
+/* A zero nanosecond cs_change delay avoids legacy default delays.
+ * Linux <5.3 has no field to express a zero-nanosecond delay.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 5, 0)
+#define SPIHD_CS_CHANGE_NO_DELAY(xfer) \
+	((xfer)->cs_change_delay.unit = SPI_DELAY_UNIT_NSECS)
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 3, 0)
+#define SPIHD_CS_CHANGE_NO_DELAY(xfer) \
+	((xfer)->cs_change_delay_unit = SPI_DELAY_UNIT_NSECS)
+#else
+#define SPIHD_CS_CHANGE_NO_DELAY(xfer) do { } while (0)
 #endif
 
 #define SPIHD_CMD_WRBUF                 0x01
@@ -260,9 +317,11 @@ static uint spi_hd_qio_h2e_diag_max_hz;
 module_param(spi_hd_qio_h2e_diag_max_hz, uint, 0644);
 MODULE_PARM_DESC(spi_hd_qio_h2e_diag_max_hz,
 		 "Diagnostic-only quad H2E SCLK cap in Hz (0 keeps negotiated clock)");
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 3, 0)
 static u32 spihd_logged_sclk_hz[2];
 /* Keep independently changing H2E and E2H QIO diagnostic rates distinct. */
 static u32 spihd_logged_h2e_qio_hz;
+#endif
 
 static bool spi_hd_wrdma_diag;
 module_param(spi_hd_wrdma_diag, bool, 0644);
@@ -385,7 +444,7 @@ static size_t spihd_control_offset(void)
 
 static bool spihd_full_duplex(void)
 {
-	return !(spi_hd.spi->controller->flags & SPI_CONTROLLER_HALF_DUPLEX);
+	return !(SPIHD_CONTROLLER(spi_hd.spi)->flags & SPIHD_CTLR_HALF_DUPLEX);
 }
 
 static bool spihd_quad_available(struct spi_device *spi)
@@ -422,28 +481,28 @@ static int spihd_sync_transfer(struct spi_device *spi,
 				i, xfer[i].len, transfer_max, message_max, total);
 			return -EMSGSIZE;
 		}
-		if (!spi_is_bpw_supported(spi, xfer[i].bits_per_word) ||
+		if (!spihd_bpw_supported(spi, xfer[i].bits_per_word) ||
 		    (xfer[i].tx_buf && xfer[i].rx_buf && !spihd_full_duplex())) {
 			dev_err_ratelimited(&spi->dev,
 				"SPI-HD unsupported phase %u bpw=%u tx=%u rx=%u controller-flags=0x%x\n",
 				i, xfer[i].bits_per_word, !!xfer[i].tx_buf,
-				!!xfer[i].rx_buf, spi->controller->flags);
+				!!xfer[i].rx_buf, SPIHD_CONTROLLER(spi)->flags);
 			return -EOPNOTSUPP;
 		}
-		if (xfer[i].speed_hz < spi->controller->min_speed_hz) {
+		if (xfer[i].speed_hz < SPIHD_CONTROLLER(spi)->min_speed_hz) {
 			dev_err_ratelimited(&spi->dev,
 				"SPI-HD phase %u clock=%uHz below controller minimum=%uHz\n",
-				i, xfer[i].speed_hz, spi->controller->min_speed_hz);
+				i, xfer[i].speed_hz, SPIHD_CONTROLLER(spi)->min_speed_hz);
 			return -ERANGE;
 		}
 		total += xfer[i].len;
-		if (xfer[i].tx_buf && object_is_on_stack(xfer[i].tx_buf)) {
+		if (xfer[i].tx_buf && spihd_buf_is_on_stack(xfer[i].tx_buf)) {
 			if (xfer[i].len > SPIHD_CONTROL_BYTES - tx_used)
 				return -EMSGSIZE;
 			original_tx[i] = xfer[i].tx_buf;
 			tx_used += xfer[i].len;
 		}
-		if (xfer[i].rx_buf && object_is_on_stack(xfer[i].rx_buf)) {
+		if (xfer[i].rx_buf && spihd_buf_is_on_stack(xfer[i].rx_buf)) {
 			if (xfer[i].len > SPIHD_CONTROL_BYTES - rx_used)
 				return -EMSGSIZE;
 			original_rx[i] = xfer[i].rx_buf;
@@ -777,7 +836,7 @@ static int spihd_enhanced_xfer_lines(u8 base_cmd, bool has_addr, u8 addr,
 		xfer[n].bits_per_word = 8;
 		xfer[n].speed_hz = control_speed;
 		xfer[n].cs_change = 1;
-		xfer[n].cs_change_delay.unit = SPI_DELAY_UNIT_NSECS;
+		SPIHD_CS_CHANGE_NO_DELAY(&xfer[n]);
 		n++;
 	}
 
@@ -814,7 +873,7 @@ static int spihd_enhanced_xfer_lines(u8 base_cmd, bool has_addr, u8 addr,
 		    !(len & 3) &&
 		    len <= (spi_hd_tx_batch ? SPI_HD_TX_BATCH_MAX : SPI_HD_BUF_SIZE) &&
 		    spi_hd.sio_buf &&
-		    spi_is_bpw_supported(spi_hd.spi, 32)) {
+		    spihd_bpw_supported(spi_hd.spi, 32)) {
 			const u8 *src = tx;
 			u32 *dst = (u32 *)spi_hd.sio_buf;
 			size_t i;
@@ -839,7 +898,7 @@ static int spihd_enhanced_xfer_lines(u8 base_cmd, bool has_addr, u8 addr,
 		xfer[n].rx_buf = rx;
 		xfer[n].rx_nbits = data_nbits;
 		if (READ_ONCE(spi_hd_qio_rx_word32) && lines == 4 && len > 256 &&
-		    !(len & 3) && spi_is_bpw_supported(spi_hd.spi, 32)) {
+		    !(len & 3) && spihd_bpw_supported(spi_hd.spi, 32)) {
 			word32 = true;
 		}
 	}
@@ -856,7 +915,7 @@ static int spihd_enhanced_xfer_lines(u8 base_cmd, bool has_addr, u8 addr,
 			end_speed = min(end_speed, READ_ONCE(spi_hd_sio_max_hz));
 		xfer[data_index].cs_change = 1;
 		/* Zero ns selects no extra delay; zero usecs defaults to 10us. */
-		xfer[data_index].cs_change_delay.unit = SPI_DELAY_UNIT_NSECS;
+		SPIHD_CS_CHANGE_NO_DELAY(&xfer[data_index]);
 		xfer[n].tx_buf = end_hdr;
 		xfer[n].len = sizeof(end_hdr);
 		xfer[n].tx_nbits = SPI_NBITS_SINGLE;
@@ -883,6 +942,7 @@ static int spihd_enhanced_xfer_lines(u8 base_cmd, bool has_addr, u8 addr,
 		}
 	}
 out:
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 3, 0)
 	if (!ret) {
 		u32 *last_rate = lines == 4 && tx ? &spihd_logged_h2e_qio_hz :
 			&spihd_logged_sclk_hz[lines == 4];
@@ -894,6 +954,7 @@ out:
 				 lines, tx ? "H2E" : "E2H");
 		}
 	}
+#endif
 	return ret;
 }
 
@@ -1013,7 +1074,7 @@ static int spihd_read_tx_len_batched(u32 *value)
 		xfer[i].speed_hz = speed;
 	}
 	xfer[0].cs_change = 1;
-	xfer[0].cs_change_delay.unit = SPI_DELAY_UNIT_NSECS;
+	SPIHD_CS_CHANGE_NO_DELAY(&xfer[0]);
 	ret = spihd_sync_transfer(spi_hd.spi, xfer, ARRAY_SIZE(xfer));
 	if (ret)
 		return ret;
@@ -2728,16 +2789,16 @@ static int spihd_probe(struct spi_device *spi)
 	}
 	spi_hd.spi_max_hz = min_t(u32, board_max_hz,
 				  SPI_HD_MAX_CLK_MHZ * NUMBER_1M);
-	if (spi->controller->max_speed_hz)
+	if (SPIHD_CONTROLLER(spi)->max_speed_hz)
 		spi_hd.spi_max_hz = min(spi_hd.spi_max_hz,
-				       spi->controller->max_speed_hz);
-	if (!spi_is_bpw_supported(spi, 8) ||
-	    (spi->controller->flags & (SPI_CONTROLLER_NO_TX | SPI_CONTROLLER_NO_RX))) {
+				       SPIHD_CONTROLLER(spi)->max_speed_hz);
+	if (!spihd_bpw_supported(spi, 8) ||
+	    (SPIHD_CONTROLLER(spi)->flags & (SPIHD_CTLR_NO_TX | SPIHD_CTLR_NO_RX))) {
 		esp_err("SPI-HD requires 8-bit words and both TX/RX phases\n");
 		return -EOPNOTSUPP;
 	}
-	if (!spi->controller->transfer && !spi->controller->transfer_one &&
-	    !spi->controller->transfer_one_message) {
+	if (!SPIHD_CONTROLLER(spi)->transfer && !SPIHD_CONTROLLER(spi)->transfer_one &&
+	    !SPIHD_CONTROLLER(spi)->transfer_one_message) {
 		esp_err("SPI-HD requires generic SPI messages; SPI-memory-only controllers need another backend\n");
 		return -EOPNOTSUPP;
 	}
@@ -2764,14 +2825,14 @@ static int spihd_probe(struct spi_device *spi)
 	spi_set_drvdata(spi, &spi_hd);
 
 	esp_info("SPI-HD controller=%s device=%s mode=0x%x flags=0x%x bpw-mask=0x%x board-max=%uHz bus-max=%uHz max-transfer=%zu max-message=%zu quad=%u full-duplex=%u\n",
-		 dev_name(&spi->controller->dev), dev_name(&spi->dev),
-		 spi->mode, spi->controller->flags,
-		 spi->controller->bits_per_word_mask, board_max_hz,
+		 dev_name(&SPIHD_CONTROLLER(spi)->dev), dev_name(&spi->dev),
+		 spi->mode, SPIHD_CONTROLLER(spi)->flags,
+		 SPIHD_CONTROLLER(spi)->bits_per_word_mask, board_max_hz,
 		 spi_hd.spi_max_hz, spi_max_transfer_size(spi),
 		 spi_max_message_size(spi), spihd_quad_available(spi),
 		 spihd_full_duplex());
 	if ((spi_hd_qio_tx_word32 || spi_hd_qio_rx_word32) &&
-	    !spi_is_bpw_supported(spi, 32))
+	    !spihd_bpw_supported(spi, 32))
 		esp_warn("SPI-HD 32-bit data words unavailable; using 8-bit words\n");
 
 	spi_hd.reset_gpio = devm_gpiod_get(&spi->dev, "reset", GPIOD_IN);
