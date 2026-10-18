@@ -990,11 +990,38 @@ static void cleanup_ap_bssid(void)
     }
 }
 
+static int wifi_unregister_wpa2_cb_ipc_fn(void *arg)
+{
+    (void)arg;
+    esp_wifi_unregister_wpa2_cb_internal();
+    return 0;
+}
+
+static int wifi_register_wpa2_cb_ipc_fn(void *arg)
+{
+    return esp_wifi_register_wpa2_cb_internal((struct wpa2_funcs *)arg);
+}
+
+static int wifi_register_wpa2_cb(struct wpa2_funcs *cb)
+{
+    static wifi_ipc_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.fn = wifi_register_wpa2_cb_ipc_fn;
+    cfg.arg = cb;
+    cfg.arg_size = 0;
+    return esp_wifi_ipc_internal(&cfg, true);
+}
+
 static void cleanup_wpa2_cb(void)
 {
     /* unregister_wpa2_cb_internal() already os_free()s the stored table
-     * (g_osi_funcs._free). Do not free it again. */
-    esp_wifi_unregister_wpa2_cb_internal();
+     * (g_osi_funcs._free). Dispatch into wifiTask to avoid racing with EAPOL. */
+    static wifi_ipc_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.fn = wifi_unregister_wpa2_cb_ipc_fn;
+    cfg.arg = NULL;
+    cfg.arg_size = 0;
+    esp_wifi_ipc_internal(&cfg, true);
     wpa2_cb = NULL;
 }
 
@@ -2619,6 +2646,27 @@ int process_reg_get(uint8_t if_type, uint8_t *payload, uint16_t payload_len)
 
 int ieee80211_delete_node(uint8_t *mac);
 
+static int wifi_del_node_ipc_fn(void *arg)
+{
+    return ieee80211_delete_node((uint8_t *)arg);
+}
+
+static int wifi_delete_node(const uint8_t *mac)
+{
+    static wifi_ipc_config_t cfg;
+    static uint8_t s_del_mac[MAC_ADDR_LEN];
+
+    if (!mac)
+        return -1;
+
+    memcpy(s_del_mac, mac, MAC_ADDR_LEN);
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.fn = wifi_del_node_ipc_fn;
+    cfg.arg = s_del_mac;
+    cfg.arg_size = 0;
+    return esp_wifi_ipc_internal(&cfg, true);
+}
+
 static int wifi_deauth_ipc_fn(void *arg)
 {
     uint32_t reason = (uint32_t)(uintptr_t)arg;
@@ -2628,7 +2676,7 @@ static int wifi_deauth_ipc_fn(void *arg)
 
 static int wifi_deauthenticate_sta(uint16_t reason)
 {
-    wifi_ipc_config_t cfg;
+    static wifi_ipc_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
     cfg.fn = wifi_deauth_ipc_fn;
     cfg.arg = (void *)(uintptr_t)reason;
@@ -2681,7 +2729,7 @@ int process_disconnect(uint8_t if_type, uint8_t *payload, uint16_t payload_len)
     } else if (if_type == ESP_AP_IF) {
         if (softap_started &&
             (wifi_mode == WIFI_MODE_AP || wifi_mode == WIFI_MODE_APSTA)) {
-            int del_ret = ieee80211_delete_node(cmd->mac);
+            int del_ret = wifi_delete_node(cmd->mac);
             if (del_ret == 0)
                 status = CMD_RESPONSE_SUCCESS;
             else
@@ -2910,7 +2958,7 @@ int process_auth_request(uint8_t if_type, uint8_t *payload, uint16_t payload_len
 		wpa2_cb->wpa2_start = wpa2_start_eapol;
 		wpa2_cb->wpa2_init = eap_peer_sm_init;
 		wpa2_cb->wpa2_deinit = eap_peer_sm_deinit;
-		ret = esp_wifi_register_wpa2_cb_internal(wpa2_cb);
+		ret = wifi_register_wpa2_cb(wpa2_cb);
 		if (ret) {
 			ESP_LOGE(TAG, "Enterprise WPA callback registration failed ret=%d", ret);
 			free(wpa2_cb);
@@ -3257,7 +3305,7 @@ int process_deinit_interface(uint8_t if_type, uint8_t *payload, uint16_t payload
     esp_hosted_monitor_snapshot_channel();
     if (if_type == ESP_STA_IF) {
         if (sta_init_flag && esp_wifi_get_mode(&wifi_mode) == 0) {
-            esp_wifi_deauthenticate_internal(WIFI_REASON_AUTH_LEAVE);
+            wifi_deauthenticate_sta(WIFI_REASON_AUTH_LEAVE);
         }
         esp_wifi_disconnect();
     }
@@ -4366,8 +4414,9 @@ int add_station_node_ap(void *data)
 
 static int add_node_ap(void *args)
 {
-    wifi_ipc_config_t cfg;
+    static wifi_ipc_config_t cfg;
 
+    memset(&cfg, 0, sizeof(cfg));
     cfg.fn = add_station_node_ap;
     cfg.arg = args;
     cfg.arg_size = 0;
