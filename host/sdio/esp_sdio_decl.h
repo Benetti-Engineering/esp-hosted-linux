@@ -102,19 +102,13 @@ struct esp_sdio_context {
 	 * Per-interface bits let HCI and RCP flush independently. */
 	atomic_t               tx_aggr_stateful_mask;
 	wait_queue_head_t      tx_aggr_stateful_waitq;
-	/* DMA-safe SDIO buffers allocated once at probe (not per IRQ/packet):
-	 * reg_buf = ISR INT_ST / INT_CLR (1 word);
-	 * rx_len_buf = PACKET_LEN only (1 word);
-	 * token_buf = TOKEN_RDATA only (1 word);
-	 * tx_aggr_buf = Host→ESP CMD53 aggregate (ESP_TX_AGGR_SIZE_MAX).
-	 * bcm2835-mmc DMA-maps CMD53 sg lists. GFP_DMA32 is the 32-bit DMA zone on
-	 * 64-bit hosts; GFP_DMA is ZONE_DMA (needed on 32-bit Raspberry Pi). Do not
-	 * use GFP_DMA on x86_64 — that is the ISA 16MB zone and the 15872-byte
-	 * aggregate can fail probe. */
-	u32                    *reg_buf;
-	u32                    *rx_len_buf;
-	u32                    *token_buf;
+	/* Persistent bulk CMD53 buffers, allocated once at probe from ordinary
+	 * page-backed kernel memory. The MMC host owns DMA mapping and applies
+	 * its device-specific DMA constraints. Small register I/O uses the MMC
+	 * core's per-function DMA-able scratch buffer via sdio_readl/writel.
+	 * rx_bounce_buf receives ESP->Host DMA before copying to skb->data. */
 	u8                     *tx_aggr_buf;
+	u8                     *rx_bounce_buf;
 	atomic_t               rx_pending;
 	/* Re-arm NEW_PACKET when PACKET_LEN has not settled after ISR ACK. */
 	struct delayed_work    rx_len_retry_work;

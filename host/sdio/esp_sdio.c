@@ -16,6 +16,7 @@
 #include <linux/err.h>
 #include <linux/property.h>
 #include <linux/slab.h>
+#include <linux/mm.h>
 #include <linux/workqueue.h>
 #include "esp_if.h"
 #include "esp_sdio_api.h"
@@ -55,14 +56,17 @@
 			(ret), __LINE__);                                      \
 } while (0);
 
-/* Persistent CMD53 buffers. GFP_DMA constrains placement on platforms whose
- * MMC host cannot map highmem; keep using the same allocator for ISR/TX
- * aggregates. 4-byte register reads reuse these buffers. */
-#if defined(CONFIG_ZONE_DMA32)
-#define ESP_SDIO_DMA_GFP (GFP_KERNEL | GFP_DMA32)
-#else
-#define ESP_SDIO_DMA_GFP (GFP_KERNEL | GFP_DMA)
-#endif
+/* Bulk CMD53 buffers are ordinary page-backed kernel memory. The MMC host
+ * owns DMA mapping and must apply its DMA mask/IOMMU/SWIOTLB/cache rules.
+ * Keep the buffers page-aligned and private to this transport, but do not
+ * impose an architecture DMA zone globally; host-specific low-memory quirks
+ * belong behind evidence-based controller/platform quirks. */
+#define ESP_SDIO_BULK_GFP GFP_KERNEL
+
+static inline unsigned int esp_sdio_reg_addr(u32 reg)
+{
+	return reg & ESP_ADDRESS_MASK;
+}
 
 static struct esp_sdio_context sdio_context;
 static atomic_t tx_pending;
@@ -263,14 +267,14 @@ static void esp_sdio_free_dma_bufs(struct esp_sdio_context *context)
 {
 	if (!context)
 		return;
-	kfree(context->reg_buf);
-	kfree(context->rx_len_buf);
-	kfree(context->token_buf);
-	kfree(context->tx_aggr_buf);
-	context->reg_buf = NULL;
-	context->rx_len_buf = NULL;
-	context->token_buf = NULL;
+	if (context->tx_aggr_buf)
+		free_pages((unsigned long)context->tx_aggr_buf,
+			   get_order(ESP_TX_AGGR_SIZE_MAX));
+	if (context->rx_bounce_buf)
+		free_pages((unsigned long)context->rx_bounce_buf,
+			   get_order(ESP_HOST_RX_AGGR_SIZE));
 	context->tx_aggr_buf = NULL;
+	context->rx_bounce_buf = NULL;
 }
 
 #ifdef ESP_DEBUG_STATS
@@ -391,29 +395,23 @@ static void esp_handle_isr(struct sdio_func *func)
 		return;
 	}
 
-	if (!context->reg_buf)
-		return;
-
 	/* sdio_claim_irq() invokes this with the host already claimed. Nested
 	 * sdio_claim_host() here can start a second CMD53 while Host→ESP DMA is
-	 * being programmed and Oops in bcm2835_mmc_transfer_dma. */
-	ret = esp_read_reg(context, ESP_SLAVE_INT_ST_REG,
-			(u8 *)context->reg_buf, sizeof(u32),
-			LOCK_ALREADY_ACQUIRED);
+	 * being programmed and Oops in bcm2835_mmc_transfer_dma. Use the MMC
+	 * core's per-function DMA-able scratch buffer via sdio_readl/writel. */
+	int_status = sdio_readl(func, esp_sdio_reg_addr(ESP_SLAVE_INT_ST_REG),
+			       &ret);
 	if (ret) {
 		CHECK_SDIO_RW_ERROR(ret);
 		esp_sdio_request_transport_recovery();
 		return;
 	}
 
-	int_status = *context->reg_buf;
-	if (int_status & ESP_SLAVE_RX_NEW_PACKET_INT) {
+	if (int_status & ESP_SLAVE_RX_NEW_PACKET_INT)
 		atomic_set(&context->rx_pending, 1);
-	}
 
-	ret = esp_write_reg(context, ESP_SLAVE_INT_CLR_REG,
-			(u8 *)context->reg_buf, sizeof(*context->reg_buf),
-			LOCK_ALREADY_ACQUIRED);
+	sdio_writel(func, int_status, esp_sdio_reg_addr(ESP_SLAVE_INT_CLR_REG),
+		    &ret);
 	CHECK_SDIO_RW_ERROR(ret);
 
 	esp_process_interrupt(context);
@@ -463,20 +461,17 @@ static void deinit_sdio_func(struct esp_sdio_context *context)
 }
 
 static int esp_sdio_read_u32(struct esp_sdio_context *context, u32 reg,
-			     u32 *dma_buf, u32 *out, u8 is_lock_needed)
+			     u32 *out, u8 is_lock_needed)
 {
-	int ret;
+	int ret = 0;
 
-	if (!context || !context->func || !dma_buf || !out)
+	if (!context || !context->func || !out)
 		return -EINVAL;
 
 	if (is_lock_needed)
 		sdio_claim_host(context->func);
 
-	ret = esp_read_reg(context, reg, (u8 *)dma_buf, sizeof(u32),
-			   LOCK_ALREADY_ACQUIRED);
-	if (!ret)
-		*out = *dma_buf;
+	*out = sdio_readl(context->func, esp_sdio_reg_addr(reg), &ret);
 
 	if (is_lock_needed)
 		sdio_release_host(context->func);
@@ -493,7 +488,7 @@ static int esp_sdio_baseline_tx_credits(struct esp_sdio_context *context)
 	int ret;
 
 	ret = esp_sdio_read_u32(context, ESP_SLAVE_TOKEN_RDATA,
-				context->token_buf, &raw, ACQUIRE_LOCK);
+				&raw, ACQUIRE_LOCK);
 	if (ret)
 		return ret;
 
@@ -511,11 +506,11 @@ static int esp_slave_get_tx_buffer_num(struct esp_sdio_context *context, u32 *tx
 	u32 raw;
 	int ret = 0;
 
-	if (!context || !context->token_buf)
-		return -ENOMEM;
+	if (!context || !context->func)
+		return -ENODEV;
 
 	ret = esp_sdio_read_u32(context, ESP_SLAVE_TOKEN_RDATA,
-				context->token_buf, &raw, is_lock_needed);
+				&raw, is_lock_needed);
 	if (ret)
 		return ret;
 
@@ -561,7 +556,7 @@ static int esp_get_len_from_slave(struct esp_sdio_context *context, u32 *rx_size
 	 * retry to allow slave publication to settle. */
 	for (;;) {
 		ret = esp_sdio_read_u32(context, ESP_SLAVE_PACKET_LEN_REG,
-					context->rx_len_buf, &raw_len, is_lock_needed);
+					&raw_len, is_lock_needed);
 		if (!ret) {
 			raw_len &= ESP_SLAVE_LEN_MASK;
 			delta = esp_sdio_rx_len_delta(raw_len, rx_byte_count);
@@ -1450,7 +1445,7 @@ static int esp_sdio_recover_transport_inner(struct esp_adapter *adapter)
 		return -ESHUTDOWN;
 
 	context = adapter->if_context;
-	if (!context->func || !context->rx_len_buf || !context->token_buf)
+	if (!context->func)
 		return -ENODEV;
 
 	host_sleep = 0;
@@ -1616,7 +1611,7 @@ static int esp_sdio_recover_transport_inner(struct esp_adapter *adapter)
 	}
 
 	ret = esp_sdio_read_u32(context, ESP_SLAVE_PACKET_LEN_REG,
-				context->rx_len_buf, &raw_len, ACQUIRE_LOCK);
+				&raw_len, ACQUIRE_LOCK);
 	if (ret) {
 		esp_err("SDIO recover: PACKET_LEN resync failed %d; trying MMC hard reset\n", ret);
 		return esp_sdio_hard_reset_and_reopen(adapter, context,
@@ -1770,8 +1765,8 @@ static int get_firmware_data(struct esp_sdio_context *context)
 	u32 val;
 	int ret = 0;
 
-	if (!context || !context->rx_len_buf || !context->token_buf)
-		return -ENOMEM;
+	if (!context || !context->func)
+		return -ENODEV;
 
 	/* A successful baseline belongs to this incarnation. Do not let a stale
 	 * reset-pending flag rebase a live session later. */
@@ -1780,7 +1775,7 @@ static int get_firmware_data(struct esp_sdio_context *context)
 	atomic_set(&sdio_need_slave_reset, 0);
 
 	ret = esp_sdio_read_u32(context, ESP_SLAVE_PACKET_LEN_REG,
-				context->rx_len_buf, &val, ACQUIRE_LOCK);
+				&val, ACQUIRE_LOCK);
 	if (ret)
 		return ret;
 
@@ -1913,6 +1908,20 @@ static struct sk_buff *read_packet(struct esp_adapter *adapter)
 	}
 
 	padded_len = ESP_SDIO_ALIGN_4(len_from_slave);
+	if (!context->rx_bounce_buf) {
+		esp_err("ESP_SDIO_RX_ERROR: RX bounce buffer missing\n");
+		sdio_release_host(context->func);
+		return NULL;
+	}
+	if (padded_len > ESP_HOST_RX_AGGR_SIZE) {
+		esp_err("ESP_SDIO_RX_ERROR: aggregate len=%u exceeds bounce %u\n",
+			padded_len, ESP_HOST_RX_AGGR_SIZE);
+		esp_schedule_fw_reset_recovery(context->adapter);
+		esp_request_firmware_restart(context->adapter);
+		sdio_release_host(context->func);
+		return NULL;
+	}
+
 	skb = esp_if_alloc_skb(context->adapter, padded_len);
 
 	if (!skb) {
@@ -1925,7 +1934,7 @@ static struct sk_buff *read_packet(struct esp_adapter *adapter)
 	}
 
 	skb_put(skb, padded_len);
-	pos = skb->data;
+	pos = context->rx_bounce_buf;
 
 	data_left = padded_len;
 	payload_left = len_from_slave;
@@ -1979,6 +1988,7 @@ static struct sk_buff *read_packet(struct esp_adapter *adapter)
 	} while (data_left > 0);
 
 	sdio_release_host(context->func);
+	memcpy(skb->data, context->rx_bounce_buf, padded_len);
 	skb_trim(skb, len_from_slave);
 
 	if (len_from_slave < sizeof(*header)) {
@@ -2830,15 +2840,14 @@ static struct esp_sdio_context *init_sdio_func(struct sdio_func *func, int *sdio
 
 	context->func = func;
 
-	/* Allocate before sdio_claim_irq(). The ISR and Host→ESP CMD53 path
-	 * DMA-map these buffers. */
-	context->reg_buf = kmalloc(sizeof(u32), ESP_SDIO_DMA_GFP);
-	context->rx_len_buf = kmalloc(sizeof(u32), ESP_SDIO_DMA_GFP);
-	context->token_buf = kmalloc(sizeof(u32), ESP_SDIO_DMA_GFP);
-	context->tx_aggr_buf = kzalloc(ESP_TX_AGGR_SIZE_MAX, ESP_SDIO_DMA_GFP);
-	if (!context->reg_buf || !context->rx_len_buf || !context->token_buf ||
-	    !context->tx_aggr_buf) {
-		esp_err("Failed to allocate DMA-safe SDIO buffers\n");
+	/* Allocate only the bulk CMD53 buffers. Register accesses use the MMC
+	 * core's per-function DMA-able scratch buffer through sdio_readl/writel. */
+	context->tx_aggr_buf = (u8 *)__get_free_pages(
+		ESP_SDIO_BULK_GFP | __GFP_ZERO, get_order(ESP_TX_AGGR_SIZE_MAX));
+	context->rx_bounce_buf = (u8 *)__get_free_pages(
+		ESP_SDIO_BULK_GFP, get_order(ESP_HOST_RX_AGGR_SIZE));
+	if (!context->tx_aggr_buf || !context->rx_bounce_buf) {
+		esp_err("Failed to allocate page-backed SDIO bulk buffers\n");
 		esp_sdio_free_dma_bufs(context);
 		context->func = NULL;
 		return NULL;
@@ -3009,7 +3018,8 @@ static int esp_probe(struct sdio_func *func,
 	 * the watchdog escalates to CLOSE_DATA_PATH and a fresh incarnation. */
 	schedule_delayed_work(&context->adapter->fw_recovery_work,
 			      msecs_to_jiffies(ESP_FW_RECOVERY_WATCHDOG_MS));
-	esp_dbg("ESP SDIO probe completed\n");
+	esp_dbg("ESP SDIO probe completed (RX bounce %u bytes)\n",
+		ESP_HOST_RX_AGGR_SIZE);
 
 	return ret;
 }
