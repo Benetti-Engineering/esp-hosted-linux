@@ -1,4 +1,5 @@
-# Merge-request governance checks enforced from the repository.
+# Validate commit history before qualification. Check editable merge-request
+# metadata after qualification so it does not block useful build/test results.
 #
 # GitLab project settings separately enforce:
 # - protected default branch / no direct pushes
@@ -8,7 +9,7 @@
 # - squash disabled
 
 .mr_governance:
-  stage: validate
+  stage: merge-gate
   image: "$LINUX_IMAGE_6_12"
   tags:
     - x86_64
@@ -42,6 +43,7 @@ mr:vnc-lib:
 
 mr:commit-policy:
   extends: .mr_governance
+  stage: preflight
   script:
     - .gitlab/ci/scripts/check-mr-commits.sh
 

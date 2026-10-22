@@ -1,0 +1,118 @@
+{
+  "schema": 1,
+  "revision": "design-20261019",
+  "target_kernel_span": [
+    "4.9",
+    "7.2"
+  ],
+  "transports": {
+    "sdio": {
+      "source": "host/sdio/esp_sdio.c",
+      "build": "esp32_sdio.ko",
+      "planned": [
+        "cmd52_cmd53_faults",
+        "mmc_claim_irq",
+        "dma_allocation_and_mapping_failures",
+        "token_credit_wrap",
+        "irq_recovery_ordering",
+        "remove_races"
+      ]
+    },
+    "spi": {
+      "source": "host/spi/esp_spi.c",
+      "build": "esp32_spi.ko",
+      "planned": [
+        "gpio_handshake",
+        "spi_message_faults",
+        "duplex_padding",
+        "workqueue_recovery",
+        "remove_races"
+      ]
+    },
+    "usb": {
+      "source": "host/usb/esp_usb.c",
+      "build": "esp32_usb.ko",
+      "planned": [
+        "urb_submit_complete_faults",
+        "dummy_hcd_gadget",
+        "disconnect_races",
+        "recovery_rearm_races",
+        "endpoint_mps_controller_integration"
+      ]
+    },
+    "spi_hd": {
+      "source": "host/spi_hd/esp_spi_hd.c",
+      "build": "esp32_spi_hd.ko",
+      "planned": [
+        "sio_qio_phases",
+        "bpw_limits",
+        "dma_safe_staging",
+        "wrdma_rddma_controller_ack",
+        "rx_batch_delivery",
+        "resync_races"
+      ]
+    }
+  },
+  "existing_images": {
+    "kind": "x86 kernel compilation SDKs",
+    "kernel_versions": [
+      "4.9.337",
+      "4.14.336",
+      "4.19.325",
+      "5.4.302",
+      "5.10.266",
+      "5.15.217",
+      "6.1.184",
+      "6.6.153",
+      "6.12.105",
+      "6.18.46",
+      "7.2.0"
+    ]
+  },
+  "future_images": [
+    {
+      "id": "x86-6.12-kunit-uml",
+      "kind": "runtime",
+      "status": "NOT_BUILT"
+    },
+    {
+      "id": "x86-6.12-dummy-hcd",
+      "kind": "runtime",
+      "status": "NOT_BUILT"
+    },
+    {
+      "id": "arm64-6.12-debug-qemu",
+      "kind": "runtime",
+      "status": "NOT_BUILT"
+    }
+  ],
+  "software_implemented": [
+    "source_contracts",
+    "shared_wire_abi_native",
+    "production_wire_span_guard_four_backends",
+    "production_wire_span_native",
+    "kernel_module_artifact_abi_audit",
+    "sdio_production_rx_counter_extracted",
+    "sdio_dma_safe_persistent_buffer_policy",
+    "usb_production_stream_parser_extracted",
+    "spi_hd_production_batch_ack_extracted",
+    "spi_production_cmd_stateful_dummy_extracted",
+    "usb_stream_fragment_coalesce_resync_mps_extracted",
+    "spi_hd_batch_ack_predicates_extracted"
+  ],
+  "software_unimplemented": [
+    "production_path_fault_injection",
+    "full_transport_parser_and_aggregation_fuzz",
+    "kunit_kernel_execution",
+    "usb_dummy_hcd_esp_gadget",
+    "spi_virtual_controller",
+    "spi_hd_phase_simulator",
+    "sdio_mock_mmc"
+  ],
+  "physical_unimplemented": [
+    "sdio_controller_dma",
+    "spi_gpio_waveforms",
+    "usb_real_host_controllers",
+    "spi_hd_qio_signal_dma"
+  ]
+}

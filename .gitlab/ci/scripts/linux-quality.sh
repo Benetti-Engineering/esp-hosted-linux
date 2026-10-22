@@ -39,24 +39,12 @@ build_one() {
 fail_on_host_warning() {
     local log="$1"
     local label="$2"
-
-    # Source warnings are hard failures: CI starts at zero warning debt.
-    if grep -E '(/host/|^host/).*\.(c|h):[0-9]+(:[0-9]+)?: warning:' "${log}"; then
-        echo "ERROR: ${label} warning in ESP-Hosted host source" >&2
-        exit 1
-    fi
-
-    # A missing include directory is a build-system error even though GCC
-    # reports it without a host/foo.c source prefix.
-    if grep -F -- '[-Wmissing-include-dirs]' "${log}"; then
-        echo "ERROR: invalid include directory in Linux host build" >&2
-        exit 1
-    fi
+    python3 .gitlab/ci/software/check_diagnostics.py --log "${log}" --label "${label}"
 }
 
 case "${MODE}" in
     warnings)
-        for transport in sdio spi usb; do
+        for transport in sdio spi usb spi_hd; do
             build_one "${transport}" CC="ccache gcc" W=1
             fail_on_host_warning "${OUT}/${transport}.log" "W=1"
         done
@@ -65,7 +53,7 @@ case "${MODE}" in
     sparse)
         command -v sparse >/dev/null
 
-        for transport in sdio spi usb; do
+        for transport in sdio spi usb spi_hd; do
             build_one "${transport}" CC="ccache gcc" C=2 CHECK=sparse
             fail_on_host_warning "${OUT}/${transport}.log" "sparse"
         done
@@ -102,7 +90,7 @@ case "${MODE}" in
 
         clang --version | head -1
 
-        for transport in sdio spi usb; do
+        for transport in sdio spi usb spi_hd; do
             build_one "${transport}" \
                 CC="ccache clang" \
                 LD=ld.lld

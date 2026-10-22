@@ -1,0 +1,103 @@
+# Five immutable linux/amd64 cross-SDK refs in .gitlab/ci/arm-images.yml.
+# They run on BuildSH/x86_64 and cross-compile ARM64/ARMv7 targets. Runner
+# selection remains manifest-owned through CI_CROSS_SDK_RUNNER_TAG.
+.software_arm_compile:
+  stage: compile
+  tags:
+    - "$CI_CROSS_SDK_RUNNER_TAG"
+  interruptible: true
+  variables:
+    GIT_SUBMODULE_STRATEGY: none
+  script:
+    - |
+      set -euo pipefail
+      test "${CI_CROSS_SDK_PROVENANCE:-}" = "recipe-v3"
+      test "${CI_CROSS_SDK_OCI_PLATFORM:-}" = "amd64"
+      test "${CI_CROSS_SDK_RUNNER_TAG:-}" = "x86_64"
+      test -n "${CI_CROSS_SDK_RECIPE_SHA256:-}"
+      test "$(cat /usr/local/share/esp-hosted-ci/image-recipe-sha256)" = "$CI_CROSS_SDK_RECIPE_SHA256"
+
+    - python3 .gitlab/ci/software/verify_sdk.py --sdk "$KERNEL" --arch "$ARCH" --kernel "$KERNEL_VERSION" --page-size "$PAGE_SIZE" --cc "${CROSS_COMPILE}gcc"
+    - bash .gitlab/ci/scripts/linux-build.sh "$KERNEL_VERSION"
+  artifacts:
+    when: always
+    expire_in: 7 days
+    paths:
+      - build-artifacts/linux/
+    reports:
+      junit: build-artifacts/linux/*/module-audit-junit.xml
+  rules:
+    - if: '$CI_CROSS_SDK_RUNNER_TAG == null || $CI_CROSS_SDK_RUNNER_TAG == ""'
+      when: never
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+    - if: '$CI_COMMIT_TAG'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - host/**/*
+        - .gitlab/ci/software-cross-arch.yml
+        - .gitlab/ci/arm-images.yml
+        - .gitlab/ci/scripts/linux-build.sh
+        - .gitlab/ci/software/verify_sdk.py
+        - .gitlab/ci/software/audit_modules.py
+        - .gitlab-ci.yml
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH'
+      changes:
+        - host/**/*
+        - .gitlab/ci/software-cross-arch.yml
+        - .gitlab/ci/arm-images.yml
+        - .gitlab/ci/scripts/linux-build.sh
+        - .gitlab/ci/software/verify_sdk.py
+        - .gitlab/ci/software/audit_modules.py
+        - .gitlab-ci.yml
+    - when: never
+
+host:arm64-6.12-4k:
+  extends: .software_arm_compile
+  image: "$LINUX_CROSS_SDK_ARM64_6_12_4K"
+  variables:
+    ARCH: "arm64"
+    CROSS_COMPILE: "aarch64-linux-gnu-"
+    KERNEL_VERSION: "6.12.105"
+    KERNEL: "/kernel-sdk/6.12.105"
+    PAGE_SIZE: "4096"
+
+host:arm64-6.12-16k:
+  extends: .software_arm_compile
+  image: "$LINUX_CROSS_SDK_ARM64_6_12_16K"
+  variables:
+    ARCH: "arm64"
+    CROSS_COMPILE: "aarch64-linux-gnu-"
+    KERNEL_VERSION: "6.12.105"
+    KERNEL: "/kernel-sdk/6.12.105"
+    PAGE_SIZE: "16384"
+
+host:arm64-6.12-64k:
+  extends: .software_arm_compile
+  image: "$LINUX_CROSS_SDK_ARM64_6_12_64K"
+  variables:
+    ARCH: "arm64"
+    CROSS_COMPILE: "aarch64-linux-gnu-"
+    KERNEL_VERSION: "6.12.105"
+    KERNEL: "/kernel-sdk/6.12.105"
+    PAGE_SIZE: "65536"
+
+host:armv7-6.1-4k:
+  extends: .software_arm_compile
+  image: "$LINUX_CROSS_SDK_ARMV7_6_1_4K"
+  variables:
+    ARCH: "arm"
+    CROSS_COMPILE: "arm-linux-gnueabihf-"
+    KERNEL_VERSION: "6.1.184"
+    KERNEL: "/kernel-sdk/6.1.184"
+    PAGE_SIZE: "4096"
+
+host:armv7-4.9-4k:
+  extends: .software_arm_compile
+  image: "$LINUX_CROSS_SDK_ARMV7_4_9_4K"
+  variables:
+    ARCH: "arm"
+    CROSS_COMPILE: "arm-linux-gnueabihf-"
+    KERNEL_VERSION: "4.9.337"
+    KERNEL: "/kernel-sdk/4.9.337"
+    PAGE_SIZE: "4096"

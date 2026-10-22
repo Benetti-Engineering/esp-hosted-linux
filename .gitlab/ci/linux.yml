@@ -1,11 +1,12 @@
 # ESP-Hosted Linux software-only CI.
 #
-# Routine compilation/static analysis runs on Espressif shared Docker runners.
+# All 11 kernel SDKs compile four transports when host/build inputs change.
 # Dedicated espdevpool hardware is intentionally not used here.
 
 .linux_rules:
   rules:
     - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$CI_COMMIT_TAG'
     - if: '$CI_PIPELINE_SOURCE == "web"'
     - changes:
         - host/**/*
@@ -13,15 +14,14 @@
         - .gitlab/ci/linux-images.yml
         - .gitlab/ci/scripts/linux-build.sh
         - .gitlab/ci/scripts/linux-quality.sh
-        - .gitlab/ci/docker/linux-base/**/*
-        - .gitlab/ci/docker/linux-kernel/**/*
-        - .gitlab/ci/kernel-sdk/**/*
+        - .gitlab/ci/software/audit_modules.py
+        - .gitlab/ci/software/check_diagnostics.py
         - .gitlab-ci.yml
 
 .linux_shared:
   extends:
     - .linux_rules
-  stage: build
+  stage: compile
   tags:
     - x86_64
   interruptible: true
@@ -42,69 +42,76 @@
   extends:
     - .linux_shared
   script:
-    - .gitlab/ci/scripts/linux-build.sh "$KERNEL_VERSION"
+    - bash .gitlab/ci/scripts/linux-build.sh "$KERNEL_VERSION"
+  artifacts:
+    when: always
+    expire_in: 7 days
+    paths:
+      - build-artifacts/linux/
+    reports:
+      junit: build-artifacts/linux/*/module-audit-junit.xml
 
-linux:compile:4.9:
+host:linux-4.9:
   extends: .linux_compile
   image: "$LINUX_IMAGE_4_9"
   variables:
     KERNEL_VERSION: "4.9.337"
 
-linux:compile:4.14:
+host:linux-4.14:
   extends: .linux_compile
   image: "$LINUX_IMAGE_4_14"
   variables:
     KERNEL_VERSION: "4.14.336"
 
-linux:compile:4.19:
+host:linux-4.19:
   extends: .linux_compile
   image: "$LINUX_IMAGE_4_19"
   variables:
     KERNEL_VERSION: "4.19.325"
 
-linux:compile:5.4:
+host:linux-5.4:
   extends: .linux_compile
   image: "$LINUX_IMAGE_5_4"
   variables:
     KERNEL_VERSION: "5.4.302"
 
-linux:compile:5.10:
+host:linux-5.10:
   extends: .linux_compile
   image: "$LINUX_IMAGE_5_10"
   variables:
     KERNEL_VERSION: "5.10.266"
 
-linux:compile:5.15:
+host:linux-5.15:
   extends: .linux_compile
   image: "$LINUX_IMAGE_5_15"
   variables:
     KERNEL_VERSION: "5.15.217"
 
-linux:compile:6.1:
+host:linux-6.1:
   extends: .linux_compile
   image: "$LINUX_IMAGE_6_1"
   variables:
     KERNEL_VERSION: "6.1.184"
 
-linux:compile:6.6:
+host:linux-6.6:
   extends: .linux_compile
   image: "$LINUX_IMAGE_6_6"
   variables:
     KERNEL_VERSION: "6.6.153"
 
-linux:compile:6.12:
+host:linux-6.12:
   extends: .linux_compile
   image: "$LINUX_IMAGE_6_12"
   variables:
     KERNEL_VERSION: "6.12.105"
 
-linux:compile:6.18:
+host:linux-6.18:
   extends: .linux_compile
   image: "$LINUX_IMAGE_6_18"
   variables:
     KERNEL_VERSION: "6.18.46"
 
-linux:compile:7.2:
+host:linux-7.2:
   extends: .linux_compile
   image: "$LINUX_IMAGE_7_2"
   variables:
@@ -113,20 +120,23 @@ linux:compile:7.2:
 # Quality gates use a recent LTS kernel so they test the current Linux API
 # without multiplying static-analysis cost across every compatibility anchor.
 
-linux:quality:warnings:
+host:warnings:
   extends: .linux_shared
+  stage: test
   image: "$LINUX_IMAGE_6_12"
   script:
-    - .gitlab/ci/scripts/linux-quality.sh warnings 6.12.105
+    - bash .gitlab/ci/scripts/linux-quality.sh warnings 6.12.105
 
-linux:quality:sparse:
+host:sparse:
   extends: .linux_shared
+  stage: test
   image: "$LINUX_IMAGE_6_12"
   script:
-    - .gitlab/ci/scripts/linux-quality.sh sparse 6.12.105
+    - bash .gitlab/ci/scripts/linux-quality.sh sparse 6.12.105
 
-linux:quality:clang:
+host:clang:
   extends: .linux_shared
+  stage: test
   image: "$LINUX_IMAGE_6_12"
   script:
-    - .gitlab/ci/scripts/linux-quality.sh clang 6.12.105
+    - bash .gitlab/ci/scripts/linux-quality.sh clang 6.12.105

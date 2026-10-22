@@ -610,7 +610,8 @@ static inline uint16_t compute_checksum(uint8_t *buf, uint16_t len)
 		while (words--) {
 			uint32_t word;
 
-			__builtin_memcpy(&word, __builtin_assume_aligned(buf, 4), 4);
+			/* The byte-wise prefix aligns buf to a 4-byte boundary. */
+			__builtin_memcpy(&word, buf, sizeof(word));
 			pairs += (word & 0x00ff00ffU) + ((word >> 8) & 0x00ff00ffU);
 			buf += 4;
 		}

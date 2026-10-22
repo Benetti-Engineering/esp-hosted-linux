@@ -15,6 +15,7 @@
 #include "esp_if.h"
 #include "esp_api.h"
 #include "esp_kernel_port.h"
+#include "esp_host_wire_bounds.h"
 #include "esp_utils.h"
 #include "esp_rcp_api.h"
 
@@ -186,11 +187,8 @@ static bool esp_usb_valid_header(const struct esp_usb_context *ctx,
 
 	offset = esp_wire_le16_to_cpu(hdr->offset);
 	payload_len = esp_wire_le16_to_cpu(hdr->len);
-	if (!payload_len || !ESP_OFFSET_VALID(offset))
-		return false;
-
-	*frame_len = (size_t)offset + payload_len;
-	return *frame_len <= ESP_USB_MAX_XFER;
+	return esp_host_wire_span_valid(payload_len, offset,
+					ESP_USB_MAX_XFER, frame_len);
 }
 
 static bool esp_usb_queue_frame_locked(struct esp_usb_context *ctx,

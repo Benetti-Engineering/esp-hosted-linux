@@ -31,6 +31,7 @@
 #include "esp_stats.h"
 #include "esp_utils.h"
 #include "esp_kernel_port.h"
+#include "esp_host_wire_bounds.h"
 
 #define MAX_WRITE_RETRIES       2000
 #define TX_MAX_PENDING_COUNT    1000
@@ -2015,7 +2016,7 @@ static struct sk_buff *read_packet(struct esp_adapter *adapter)
 		return NULL;
 	}
 	frame_len = len + offset;
-	if (frame_len > len_from_slave) {
+	if (!esp_host_wire_span_valid(len, offset, len_from_slave, NULL)) {
 		esp_err("ESP_SDIO_RX_FRAME_ERROR: truncated first frame aggregate=%u "
 			"len=%u offset=%u frame=%u if=%u pkt=%u "
 			"rx_byte_count=%u\n",

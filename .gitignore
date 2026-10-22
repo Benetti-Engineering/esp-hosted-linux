@@ -51,3 +51,7 @@ build-artifacts/
 .DS_Store
 .vscode/
 .idea/
+
+# Python bytecode/cache artifacts
+__pycache__/
+*.py[cod]

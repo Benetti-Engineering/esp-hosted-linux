@@ -1,0 +1,42 @@
+# Four-transport software framework, entirely GitLab CI.
+# Fast foundation is an automatic gate for relevant merge requests and pushes.
+# No physical HIL runs here. This job executes native source-backed tests.
+software:foundation:
+  stage: test
+  image: "$LINUX_IMAGE_6_12"
+  tags:
+    - x86_64
+  interruptible: true
+  variables:
+    GIT_SUBMODULE_STRATEGY: none
+    SOFTWARE_SANITIZERS: "undefined"
+  script:
+    - python3 .gitlab/ci/software/run.py --root . --out build-artifacts/software
+  artifacts:
+    when: always
+    expire_in: 7 days
+    paths:
+      - build-artifacts/software/
+    reports:
+      junit: build-artifacts/software/junit.xml
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$CI_COMMIT_TAG'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - host/**/*
+        - tests/software/**/*
+        - .gitlab/ci/software-framework.yml
+        - .gitlab/ci/software/**/*
+        - .gitlab/ci/scripts/linux-quality.sh
+        - .gitlab-ci.yml
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH'
+      changes:
+        - host/**/*
+        - tests/software/**/*
+        - .gitlab/ci/software-framework.yml
+        - .gitlab/ci/software/**/*
+        - .gitlab/ci/scripts/linux-quality.sh
+        - .gitlab-ci.yml
+    - when: never
