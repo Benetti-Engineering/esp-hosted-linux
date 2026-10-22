@@ -2,7 +2,7 @@ exclude: '^(?:docs-html/|docs/assets/espressif-(?:icon|logo)\.svg$)'
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v5.0.0
+    rev: cef0300fd0fc4d2a87a85fa2093c6b283ea36f4b  # v5.0.0
     hooks:
       - id: trailing-whitespace
         exclude: '\.patch$'
@@ -15,6 +15,6 @@ repos:
       - id: check-shebang-scripts-are-executable
 
   - repo: https://github.com/codespell-project/codespell
-    rev: v2.4.1
+    rev: 63c8f8312b7559622c0d82815639671ae42132ac  # v2.4.1
     hooks:
       - id: codespell

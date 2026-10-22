@@ -16,11 +16,10 @@
 #include <linux/mutex.h>
 
 /*
- * adapter.h is shared with the ESP firmware and therefore uses portable
- * uint16_t/uint32_t/uint64_t fields for on-wire values instead of Linux
- * __le16/__le32/__le64 annotations. Keep the shared ABI portable and make
- * the Linux endian/type boundary explicit here so sparse can validate all
- * protocol accesses.
+ * adapter.h is shared with ESP firmware, so on-wire fields use portable
+ * uint16_t/uint32_t/uint64_t types rather than Linux __le16/__le32/__le64.
+ * Perform endian conversion at the Linux boundary with explicit type
+ * annotations to avoid mixing host and wire byte order.
  */
 static inline u16 esp_wire_cpu_to_le16(u16 value)
 {

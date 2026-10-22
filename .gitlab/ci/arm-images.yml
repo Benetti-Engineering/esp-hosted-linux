@@ -1,0 +1,15 @@
+# Immutable linux/amd64 cross-SDK images for ARM64/ARMv7 qualification.
+#
+# The containers run on the BuildSH/x86_64 runner fleet and cross-compile the
+# target architectures. Images are built and SDK/toolchain-verified out of band;
+# CI performs the mandatory real esp-hosted driver compilation against them.
+variables:
+  CI_CROSS_SDK_OCI_PLATFORM: "amd64"
+  CI_CROSS_SDK_RUNNER_TAG: "x86_64"
+  CI_CROSS_SDK_PROVENANCE: "recipe-v3"
+  CI_CROSS_SDK_RECIPE_SHA256: "c4ca6296d6733e57a1919eea9e19da184a63c19dbb3f002d19d45a828ccd1756"
+  LINUX_CROSS_SDK_ARM64_6_12_4K: "gitlab.espressif.cn:5050/wireless/esp-hosted-linux/ci/linux-cross-sdk@sha256:b726fc18ef12dafa4dcb1f1caa078c5fedd35068939e59292c7cf843ed5d5c11"
+  LINUX_CROSS_SDK_ARM64_6_12_16K: "gitlab.espressif.cn:5050/wireless/esp-hosted-linux/ci/linux-cross-sdk@sha256:1dff4275c01934140a26b0725f63efdcbcfc1b604f9695f07f4402fde87fdee3"
+  LINUX_CROSS_SDK_ARM64_6_12_64K: "gitlab.espressif.cn:5050/wireless/esp-hosted-linux/ci/linux-cross-sdk@sha256:8d250ca5a25d61965cb1f0ce67fc631bdb23866812c0a0be882c2b38c7ad585c"
+  LINUX_CROSS_SDK_ARMV7_6_1_4K: "gitlab.espressif.cn:5050/wireless/esp-hosted-linux/ci/linux-cross-sdk@sha256:1efbf271e6adb66cd6afcc4f6fa403f9b4c00ea67578335eeeede3998b65c18d"
+  LINUX_CROSS_SDK_ARMV7_4_9_4K: "gitlab.espressif.cn:5050/wireless/esp-hosted-linux/ci/linux-cross-sdk@sha256:1e37cd7214f1e230f421df63e83aad9bb2a68889a6c6c8e58b6fc7dc36a3609d"

@@ -2,7 +2,7 @@
 # These jobs stay on the existing ESP-IDF build runners, not espdevpool1.
 
 .firmware_build:
-  stage: build
+  stage: compile
   image: "$ESP_CI_IMAGE"
   tags:
     - build
@@ -24,7 +24,7 @@
         - .gitlab/ci/scripts/build-firmware.sh
         - .gitlab-ci.yml
 
-firmware_build:
+firmware:
   extends: .firmware_build
   parallel:
     matrix:
@@ -38,9 +38,12 @@ firmware_build:
         TRANSPORT: ["spi"]
       - IDF_TARGET: ["esp32s31"]
         TRANSPORT: ["spi", "usb"]
+      # SPI-HD/QSPI is one more firmware transport, not a separate pipeline.
+      - IDF_TARGET: ["esp32s2", "esp32s3", "esp32c2", "esp32c3", "esp32c5", "esp32c6", "esp32c61", "esp32s31"]
+        TRANSPORT: ["spi_hd"]
 
 # Preserve the old CI policy until ESP32-C5 SDIO is promoted to a hard gate.
-firmware_build_esp32c5_sdio:
+firmware:c5-sdio:
   extends: .firmware_build
   variables:
     IDF_TARGET: "esp32c5"

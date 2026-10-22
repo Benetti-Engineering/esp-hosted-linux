@@ -8,7 +8,11 @@ KERNEL="${KERNEL:-/kernel-sdk/${KERNEL_VERSION}}"
 HOST_DIR="${CI_PROJECT_DIR:-$(pwd)}/host"
 OUT_ROOT="${CI_PROJECT_DIR:-$(pwd)}/build-artifacts/linux/${KERNEL_VERSION}"
 
-if command -v ccache >/dev/null 2>&1; then
+# A cross build must not force the host GCC through CC. Prefer the
+# SDK-compatible CROSS_COMPILE compiler, unless explicitly overridden.
+if [[ -n "${CROSS_COMPILE}" ]]; then
+    CC_CMD="${CC_CMD:-${CROSS_COMPILE}gcc}"
+elif command -v ccache >/dev/null 2>&1; then
     CC_CMD="${CC_CMD:-ccache gcc}"
 else
     CC_CMD="${CC_CMD:-gcc}"
@@ -108,6 +112,11 @@ make -C "${HOST_DIR}" \
     echo "compiler=$(${CC_CMD} --version | head -1)"
     echo "commit=${CI_COMMIT_SHA:-unknown}"
 } > "${OUT_ROOT}/build-info.txt"
+
+# Audit real module ELF architecture, vermagic, SHA-256, and ARM runtime
+# linkage before granting this four-transport compatibility job a PASS.
+python3 .gitlab/ci/software/audit_modules.py \
+    --directory "${OUT_ROOT}" --kernel "${KERNEL_VERSION}" --arch "${ARCH}"
 
 if command -v ccache >/dev/null 2>&1; then
     echo "=== ccache ==="

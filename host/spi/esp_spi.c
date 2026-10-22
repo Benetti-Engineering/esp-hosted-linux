@@ -16,6 +16,7 @@
 #include "esp_bt_api.h"
 #include "esp_rcp_api.h"
 #include "esp_kernel_port.h"
+#include "esp_host_wire_bounds.h"
 #include "esp_stats.h"
 #include "esp_utils.h"
 #include "esp_cfg80211.h"
@@ -1185,8 +1186,8 @@ static int process_rx_buf(struct sk_buff *skb, bool rx_pending)
 		esp_spi_fail_rcp_rx("zero payload");
 		return -EINVAL;
 	}
-	if (len > SPI_BUF_SIZE || !ESP_OFFSET_VALID(offset) ||
-	    offset > skb->len || len > (skb->len - offset)) {
+	if (len > SPI_BUF_SIZE ||
+	    !esp_host_wire_span_valid(len, offset, skb->len, NULL)) {
 		esp_err("Drop invalid pkt: len=%d offset=%d skb_len=%u\n", len, offset, skb->len);
 		esp_spi_fail_rcp_rx("invalid length/offset");
 		return -EINVAL;

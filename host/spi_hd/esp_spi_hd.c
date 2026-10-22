@@ -28,6 +28,7 @@
 #include <linux/gpio/consumer.h>
 #include <linux/interrupt.h>
 #include <linux/ktime.h>
+#include <linux/math64.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
@@ -47,6 +48,7 @@
 #include "esp_cfg80211.h"
 #include "esp_if.h"
 #include "esp_kernel_port.h"
+#include "esp_host_wire_bounds.h"
 #include "esp_spi_hd.h"
 #include "esp_stats.h"
 #include "esp_utils.h"
@@ -551,7 +553,7 @@ static int spihd_sync_transfer(struct spi_device *spi,
 			spi_hd.tx_inflight, spi_hd.rx_inflight);
 	if (verbose)
 		esp_verbose("SPI-HD message phases=%u bytes=%zu ret=%d elapsed_us=%llu\n",
-			n, total, ret, (ktime_get_ns() - started) / 1000);
+			n, total, ret, div_u64(ktime_get_ns() - started, 1000));
 	return ret;
 }
 
@@ -1169,7 +1171,7 @@ static int spihd_rddma(void *buf, size_t len)
 	ret = spihd_enhanced_xfer_lines(SPIHD_CMD_RDDMA, true, 0,
 					 NULL, buf, len, lines);
 	if (timing)
-		spi_hd_stat_rddma_us += (ktime_get_ns() - started) / 1000;
+		spi_hd_stat_rddma_us += div_u64(ktime_get_ns() - started, 1000);
 	if (ret) {
 		if (ret == -EINVAL || ret == -EOPNOTSUPP ||
 		    ret == -EMSGSIZE || ret == -ERANGE)
@@ -1182,7 +1184,7 @@ static int spihd_rddma(void *buf, size_t len)
 			started = ktime_get_ns();
 		ret = spihd_command_lines(SPIHD_CMD_INT0, spihd_e2h_control_lines());
 		if (timing)
-			spi_hd_stat_rx_int0_us += (ktime_get_ns() - started) / 1000;
+			spi_hd_stat_rx_int0_us += div_u64(ktime_get_ns() - started, 1000);
 	}
 	if (!ret)
 		spi_hd.rx_inflight = false;
@@ -1216,7 +1218,7 @@ static int spihd_wrdma_segment(const void *buf, size_t len, u8 wr_lines)
 	ret = spihd_enhanced_xfer_lines(SPIHD_CMD_WRDMA, true, 0,
 					 buf, NULL, len, wr_lines);
 	if (timing)
-		spi_hd_stat_wrdma_us += (ktime_get_ns() - started) / 1000;
+		spi_hd_stat_wrdma_us += div_u64(ktime_get_ns() - started, 1000);
 	if (ret) {
 		/* Rejected by the controller before anything was clocked out. */
 		if (ret == -EINVAL || ret == -EOPNOTSUPP ||
@@ -1232,7 +1234,7 @@ static int spihd_wrdma_segment(const void *buf, size_t len, u8 wr_lines)
 			started = ktime_get_ns();
 		ret = spihd_command_lines(SPIHD_CMD_WR_END, end_lines);
 		if (timing)
-			spi_hd_stat_wrend_us += (ktime_get_ns() - started) / 1000;
+			spi_hd_stat_wrend_us += div_u64(ktime_get_ns() - started, 1000);
 	}
 	if (ret) {
 		esp_err("SPI-HD WR_END failure: len=%zu lines=%u ret=%d\n",
@@ -1465,7 +1467,7 @@ static int spihd_send_frame(struct sk_buff *skb)
 			started = ktime_get_ns();
 		ret = spihd_wait_tx_credit();
 		if (timing)
-			spi_hd_stat_credit_us += (ktime_get_ns() - started) / 1000;
+			spi_hd_stat_credit_us += div_u64(ktime_get_ns() - started, 1000);
 		if (ret)
 			return ret;
 
@@ -1505,9 +1507,9 @@ static int spihd_validate_rx_batch(const u8 *data, size_t total, u32 *frames)
 		offset = esp_wire_le16_to_cpu(header->offset);
 		len = esp_wire_le16_to_cpu(header->len);
 		frame_len = (size_t)offset + len;
-		if (header->if_type >= ESP_MAX_IF || !len ||
-		    !ESP_OFFSET_VALID(offset) || frame_len > SPI_HD_BUF_SIZE ||
-		    frame_len > total - pos)
+		if (header->if_type >= ESP_MAX_IF ||
+		    !esp_host_wire_span_valid(len, offset, SPI_HD_BUF_SIZE, NULL) ||
+		    !esp_host_wire_span_valid(len, offset, total - pos, NULL))
 			return -EPROTO;
 		/* Legacy boot/control packets can be a sole unpadded frame. */
 		span = frame_len == total - pos ? frame_len : ALIGN(frame_len, 4);
@@ -1538,8 +1540,7 @@ static int spihd_process_rx_buf(struct sk_buff *skb)
 
 	offset = esp_wire_le16_to_cpu(header->offset);
 	len = esp_wire_le16_to_cpu(header->len);
-	if (!len || !ESP_OFFSET_VALID(offset) ||
-	    offset > skb->len || len > skb->len - offset)
+	if (!esp_host_wire_span_valid(len, offset, skb->len, NULL))
 		return -EINVAL;
 
 	skb_trim(skb, offset + len);
@@ -1643,7 +1644,7 @@ static int spihd_receive_one(void)
 	else
 		ret = spihd_read_reg_stable(SPIHD_REG_TX_BUF_LEN, &status_word);
 	if (timing)
-		spi_hd_stat_rx_len_us += (ktime_get_ns() - started) / 1000;
+		spi_hd_stat_rx_len_us += div_u64(ktime_get_ns() - started, 1000);
 	if (ret)
 		return ret;
 
@@ -1658,7 +1659,7 @@ static int spihd_receive_one(void)
 			started = ktime_get_ns();
 		ret = spihd_command_lines(SPIHD_CMD_INT1, spihd_e2h_control_lines());
 		if (timing)
-			spi_hd_stat_rx_int1_us += (ktime_get_ns() - started) / 1000;
+			spi_hd_stat_rx_int1_us += div_u64(ktime_get_ns() - started, 1000);
 		if (ret)
 			return ret;
 	}
