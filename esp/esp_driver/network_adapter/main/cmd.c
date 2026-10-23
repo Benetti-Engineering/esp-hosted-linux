@@ -394,6 +394,14 @@ static bool hosted_mgmt_frame_matches_locked(const uint8_t *candidate,
         memcmp(candidate + 4, reference + 4, 18) != 0)
         return false;
 
+    /* wifi-lib sets Protected and replaces the body with a CCMP/GCMP header
+     * plus ciphertext. Same rule as mac80211: do not parse a protected mgmt
+     * body. Only robust frames may be encrypted; Public Action / Auth stay
+     * on the plaintext prefix so a firmware ADDBA cannot steal that cookie. */
+    if ((candidate[1] & WLAN_FC_PROTECTED) &&
+        wlan_is_robust_mgmt_plain(reference, s_hosted_mgmt.frame_len))
+        return true;
+
     body_len = s_hosted_mgmt.frame_len - HOSTED_MGMT_HDR_LEN;
     if (body_len > HOSTED_MGMT_BODY_MATCH_LEN)
         body_len = HOSTED_MGMT_BODY_MATCH_LEN;
@@ -4361,7 +4369,8 @@ int process_mgmt_tx(uint8_t if_type, uint8_t *payload, uint16_t payload_len)
 }
 
 int ieee80211_add_node(wifi_interface_t wifi_if_type, uint8_t *mac, uint16_t aid,
-                       uint8_t *rates, uint8_t *htcap, uint8_t *vhtcap, uint8_t *hecap);
+                       uint8_t *rates, uint8_t *htcap, uint8_t *vhtcap, uint8_t *hecap,
+                       bool is_pmf);
 
 int add_station_node_ap(void *data)
 {
@@ -4375,6 +4384,7 @@ int add_station_node_ap(void *data)
     ESP_LOGI(TAG, "aid=%d\n", aid);
 
 #define STA_FLAG_AUTHORIZED 1
+#define STA_FLAG_MFP        4
     if (cmd == CHANGE_STA) {
         ESP_LOGD(TAG, "sta_flags_set=%lu, sta_flags_mask=%lu sta_modify_mask=%lu\n",
                  (unsigned long)flags_set, (unsigned long)flags_mask,
@@ -4398,6 +4408,7 @@ int add_station_node_ap(void *data)
         }
         return ESP_OK;
     } else if (cmd == ADD_STA) {
+        bool is_pmf = !!(flags_set & BIT(STA_FLAG_MFP));
         ESP_LOG_BUFFER_HEXDUMP("supported_rates", sta->sta_param.supported_rates, 12, ESP_LOG_INFO);
         ESP_LOG_BUFFER_HEXDUMP("ht_rates", sta->sta_param.ht_caps, 28, ESP_LOG_INFO);
         ESP_LOG_BUFFER_HEXDUMP("vht_rates", sta->sta_param.vht_caps, 14, ESP_LOG_INFO);
@@ -4406,7 +4417,8 @@ int add_station_node_ap(void *data)
                                   sta->sta_param.supported_rates[0] ? sta->sta_param.supported_rates : NULL,
                                   sta->sta_param.ht_caps[0] ? sta->sta_param.ht_caps : NULL,
                                   sta->sta_param.vht_caps[0] ? sta->sta_param.vht_caps : NULL,
-                                  sta->sta_param.he_caps[0] ? sta->sta_param.he_caps : NULL);
+                                  sta->sta_param.he_caps[0] ? sta->sta_param.he_caps : NULL,
+                                  is_pmf);
     }
     ESP_LOGE(TAG, "Invalid AP station operation cmd=%u", cmd);
     return ESP_ERR_INVALID_ARG;
