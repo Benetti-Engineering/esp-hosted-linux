@@ -370,7 +370,7 @@ void esp_wifi_sta_toggle_wpa3_security(bool disable);
 uint32_t esp_wifi_get_eb_data_len(void *eb_buf);
 uint8_t *esp_wifi_get_eb_data(void *eb_buf);
 int ieee80211_add_node(wifi_interface_t interface, uint8_t *mac, uint16_t aid, uint8_t *rates,
-                       uint8_t *htcap, uint8_t *vhtcap, uint8_t *hecap);
+                       uint8_t *htcap, uint8_t *vhtcap, uint8_t *hecap, bool is_pmf);
 int ieee80211_delete_node(uint8_t *mac);
 int ieee80211_send_mgmt_internal(wifi_interface_t interface, uint8_t *buf, size_t len);
 esp_err_t esp_wifi_send_auth_internal(uint8_t ifx, uint8_t *bssid, uint8_t algo, uint8_t seq,
